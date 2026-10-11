@@ -11,6 +11,11 @@ This directory contains AI Passport engineering rules and reusable workflows, gr
 - [ai-guide.md](ai-guide.md): AI-assisted development workflow.
 - [Core AI skills](../../skills/README.md): development, setup, build, device testing, and diagnosis; installation and usage examples.
 
+## Applications
+
+- [game-2048.md](applications/game-2048.md): an offline 2048 game — portrait screens, three-key direction wheel, NVS resume, synthesized cues, and idle deep sleep.
+- [deepseek-balance-whale.md](applications/deepseek-balance-whale.md): a DeepSeek balance widget card — web provisioning for the API key, a whale drawn from shapes, a coin cue on spend, and a day-rolling ledger.
+
 ## Engineering
 
 - [game-demo-to-device-acceptance.md](engineering/game-demo-to-device-acceptance.md): shared C/WebAssembly and H5 playtesting, then physical-device acceptance.

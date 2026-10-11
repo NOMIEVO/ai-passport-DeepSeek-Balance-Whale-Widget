@@ -1,226 +1,730 @@
-// main/main.c —— FoloToy AI Passport BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
+// main/main.c —— 小鲸鱼计费名片的应用入口。
 //
-// 按键语义(全局统一):
-//   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
-//   确定  短按   菜单中=进入选中项;演示页中=该页自定义
-//   确定  长按   演示页中=返回菜单(由本文件统一拦截)
-#include "bsp_i2c.h"
-#include "bsp_display.h"
-#include "bsp_button.h"
+// 职责:BSP 初始化、三键输入分发、网络任务编排、空闲息屏/深睡。
+// 界面在 whale_ui.c、金额与记账规则在 whale_model.c、联网在 whale_net.c、
+// 配网网页在 whale_prov.c、持久化在 whale_store.c、声音在 whale_audio.c。
+//
+// 按键语义(本应用自定义,与基线 demo 无关)。交互一律以长按为主,与挂件一致:
+// 挂件在手机端是「长按鲸鱼约 1.5 秒唤出菜单」,名片就把长按确定键做成唤出菜单。
+//   挂件页   确定 短按   推进泡泡序列(余额 → 今日已用 → 峰谷 → 连接 → 收起)
+//            上/下 短按   上一项 / 下一项(走到末项再按即收起)
+//            确定 长按   唤出菜单(设置页)
+//            上   长按   立即刷新余额
+//            下   长按   试听当前消费音效
+//   菜单页   上/下 短按   上下移动选中项
+//            确定 短按   执行 / 切换选中项
+//            确定 长按   返回挂件页
+//            配网项 长按  清除已存凭据(危险操作,必须长按)
+//   配网页   确定 短按   用已保存凭据重连一次
+//            确定 长按   关闭热点并返回挂件页
+//   任意键                点亮屏幕并刷新空闲计时
 #include "bsp_audio.h"
 #include "bsp_battery.h"
-#include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
-#include "demo.h"
-#include "demo_navigation.h"
-#include "key_guard.h"
-#include "ui_pixel.h"
-#include "lvgl.h"
+#include "bsp_button.h"
+#include "bsp_display.h"
+#include "bsp_i2c.h"
+#include "bsp_pins.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "key_guard.h"
+#include "whale_audio.h"
+#include "whale_form.h"
+#include "whale_model.h"
+#include "whale_net.h"
+#include "whale_prov.h"
+#include "whale_store.h"
+#include "whale_ui.h"
+#include <stdio.h>
+#include <string.h>
 
-static const char *TAG = "main";
+static const char *TAG = "whale";
 
-static const demo_entry_t DEMOS[] = {
-    { .name = "Display", .enter = demo_display_enter, .exit = demo_display_exit,
-      .key = demo_display_key },
-    { .name = "Button", .enter = demo_button_enter, .exit = demo_button_exit,
-      .key = demo_button_key },
-    { .name = "Audio", .enter = demo_audio_enter, .exit = demo_audio_exit,
-      .key = demo_audio_key, .start = demo_audio_start, .stop = demo_audio_stop },
-    { .name = "Battery", .enter = demo_battery_enter, .exit = demo_battery_exit,
-      .key = demo_battery_key },
-    { .name = "Wi-Fi", .enter = demo_wifi_enter, .exit = demo_wifi_exit,
-      .key = demo_wifi_key, .start = demo_wifi_start, .stop = demo_wifi_stop },
-    { .name = "BLE", .enter = demo_ble_enter, .exit = demo_ble_exit,
-      .key = demo_ble_key, .start = demo_ble_start, .stop = demo_ble_stop },
-    { .name = "Low Power", .enter = demo_low_power_enter, .exit = demo_low_power_exit,
-      .key = demo_low_power_key, .start = demo_low_power_start, .stop = demo_low_power_stop },
-};
-#define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 #define INPUT_QUEUE_DEPTH 8
+#define CMD_QUEUE_DEPTH   8
+
+// 熄屏时长由「熄屏时间」菜单项决定(main 层按 s_config.sleep_sec 换算),
+// 这里只保留调暗到休眠的比例:半程调暗提示,到点入睡。
+#define IDLE_DIM_DIVISOR    2
+#define BATTERY_REFRESH_US  (10LL * 1000 * 1000)
+#define KEY_GUARD_MAX_US    (10LL * 1000 * 1000)
+#define CONNECT_TIMEOUT_MS  20000
+#define TIME_SYNC_TIMEOUT_MS 8000
+
+typedef enum {
+    CMD_CONNECT = 0,      // 用当前配置连 Wi-Fi(成功后授时 + 取一次余额)
+    CMD_REFRESH,          // 直接取一次余额(已连接时)
+    CMD_CONFIG_SAVED,     // 网页刚保存了配置
+    CMD_PROV_START,
+    CMD_PROV_STOP,
+    CMD_CLEAR_CREDS,
+} app_cmd_t;
 
 typedef struct {
     bsp_btn_t btn;
     bsp_btn_ev_t event;
 } input_event_t;
 
-// 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
-static bool s_ok[DEMO_COUNT];
+static whale_config_t s_config;
+static whale_ledger_t s_ledger;
+static whale_ui_state_t s_ui;
+static whale_setting_t s_setting = WHALE_SET_PROVISION;
 
-static lv_obj_t *s_menu_scr;
-static lv_obj_t *s_cards[DEMO_COUNT];
-static lv_obj_t *s_rows[DEMO_COUNT];
-static lv_obj_t *s_mascot;
-static demo_navigation_t s_navigation;
+static key_guard_t s_key_guard;
 static QueueHandle_t s_input_queue;
-static TaskHandle_t s_input_task;
-static volatile bool s_input_ready;
+static QueueHandle_t s_cmd_queue;
+static TaskHandle_t s_net_task;
+static volatile bool s_ready;
+static volatile bool s_busy;         // 联网/配网进行中 → 不进入深睡
+static volatile bool s_sleeping;
+static int64_t s_last_activity_us;
+static int64_t s_last_battery_us;
+static int64_t s_last_refresh_us;
+static bool s_dimmed;
+static bool s_bubble_open = true;   // 泡泡是否展开(收起时只留小鲸鱼)
+static bool s_budget_hit;           // 今日已用已触达预算(只提示一次)
+static bool s_warn_hit;             // 余额已低于预警线(只提示一次)
 
-static void menu_refresh(void) {
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        lv_label_set_text_fmt(s_rows[i], "%s%s",
-                              DEMOS[i].name,
-                              s_ok[i] ? "" : "  [FAIL]");
-        ui_pixel_set_selected(s_cards[i], i == s_navigation.selected, s_ok[i]);
-        lv_obj_set_style_text_color(s_rows[i],
-            s_ok[i] ? lv_color_hex(UI_INK) : lv_color_hex(0x7A2020), 0);
+// 音效总开关的唯一闸口:所有发声都过这里,关掉后一律静音。
+static void play_sound(whale_sound_t sound)
+{
+    if (!s_config.sound_all) return;
+    whale_audio_play(sound);
+}
+
+// 按压音:短按与长按都算"按压",统一受「按压音效」开关管,
+// 否则会出现"关了按压音,长按却还在响"这种说不通的行为。
+// 同时触发一次 Q 弹 —— 参考挂件里按压音与 Q 弹是同一个动作的两面(只在挂件页弹,
+// 别的页面没有舞台)。
+static void press_cue(void)
+{
+    if (s_config.sound_press) play_sound(WHALE_SND_PRESS);
+    if (whale_ui_current_page() == WHALE_PAGE_HOME) whale_ui_boing();
+}
+
+// ---- 挂件页状态组装 --------------------------------------------------------
+
+static void refresh_time_fields(void)
+{
+    char day[WHALE_DAY_LEN];
+    int weekday = 0;
+    int minute_of_day = 0;
+    if (whale_net_local_time(day, sizeof(day), &weekday, &minute_of_day)) {
+        s_ui.tariff_known = true;
+        s_ui.tariff = whale_tariff_at(weekday, minute_of_day);
+        s_ui.minutes_to_change = whale_tariff_minutes_to_change(weekday, minute_of_day);
+        // 夹一次范围:既挡住异常值,也让编译器能确认格式化后一定放得下。
+        int hour = minute_of_day / 60;
+        int minute = minute_of_day % 60;
+        if (hour < 0) hour = 0;
+        if (hour > 23) hour = 23;
+        if (minute < 0) minute = 0;
+        if (minute > 59) minute = 59;
+        snprintf(s_ui.updated, sizeof(s_ui.updated), "%02d:%02d", hour, minute);
+    } else {
+        s_ui.tariff_known = false;
+        snprintf(s_ui.updated, sizeof(s_ui.updated), "--:--");
     }
 }
 
-static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("FoloToy");
+static void publish_ui(void)
+{
+    char ip[18] = "";
+    whale_net_has_ip(ip, sizeof(ip));
+    snprintf(s_ui.ip, sizeof(s_ui.ip), "%s", ip);
+    s_ui.bubble_open = s_bubble_open;
+    // 样式是枚举,但 NVS 里存的是 int:这里夹一次,脏值退回默认而不是渲染到越界分支。
+    s_ui.peak_style = whale_peak_style_clamp(s_config.peak_style);
+    refresh_time_fields();
+    whale_ui_update(&s_ui);
+}
 
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 47;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
-        s_rows[i] = lv_label_create(s_cards[i]);
-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(s_rows[i]);
+static void push_cmd(app_cmd_t cmd)
+{
+    if (s_cmd_queue == NULL) return;
+    (void)xQueueSend(s_cmd_queue, &cmd, 0);
+}
+
+// 网页表单保存后的回调(运行在 httpd 任务里):只更新内存里的配置并投递命令。
+static void on_form_saved(const whale_config_t *saved, void *user);
+
+static void sync_credential_preview(void)
+{
+    whale_text_ascii_preview(s_config.ssid, s_ui.ssid_preview, sizeof(s_ui.ssid_preview));
+    if (s_config.api_key[0] != '\0') {
+        const size_t len = strlen(s_config.api_key);
+        snprintf(s_ui.key_hint, sizeof(s_ui.key_hint), len > 4 ? "…%s" : "set",
+                 len > 4 ? s_config.api_key + len - 4 : "");
+    } else {
+        snprintf(s_ui.key_hint, sizeof(s_ui.key_hint), "none");
+    }
+    s_ui.refresh_sec = s_config.refresh_sec;
+}
+
+// ---- 余额刷新 --------------------------------------------------------------
+
+static void on_balance_event(whale_ledger_event_t event, int64_t delta_cents)
+{
+    if (event == WHALE_LEDGER_SPEND) {
+        // 消费:金币声 + 掉落动画。声音与界面各走各的通道,互不加锁。
+        if (s_config.sound_spend) play_sound(WHALE_SND_COIN);
+        whale_ui_coin_drop();
+        ESP_LOGI(TAG, "检测到消费 %lld 分,今日累计 %lld 分",
+                 (long long)-delta_cents, (long long)s_ledger.used_cents);
+    } else if (event == WHALE_LEDGER_TOPUP) {
+        ESP_LOGI(TAG, "检测到充值 %lld 分(不冲抵消费)", (long long)delta_cents);
+    }
+    whale_store_save_ledger(&s_ledger);
+}
+
+// 预算与预警:越过阈值时响一次,并占用状态行。
+// 用 s_budget_hit / s_warn_hit 记"已经提示过",否则每次自动刷新都要重响一遍。
+static void check_thresholds(void)
+{
+    const bool budget = whale_budget_exceeded(s_ledger.used_cents, s_config.budget_cents);
+    const bool low = whale_balance_low(s_ui.balance_cents, s_config.warn_cents);
+
+    if (budget && !s_budget_hit) {
+        s_budget_hit = true;
+        play_sound(WHALE_SND_WARN);
+        ESP_LOGW(TAG, "今日已用 %lld 分,触达预算 %lld 分", (long long)s_ledger.used_cents,
+                 (long long)s_config.budget_cents);
+    }
+    if (!budget) s_budget_hit = false;
+
+    if (low && !s_warn_hit) {
+        s_warn_hit = true;
+        play_sound(WHALE_SND_WARN);
+        ESP_LOGW(TAG, "余额 %lld 分,低于预警线 %lld 分", (long long)s_ui.balance_cents,
+                 (long long)s_config.warn_cents);
+    }
+    if (!low) s_warn_hit = false;
+
+    // 预警优先于"已连接":这两条才是用户需要立刻看见的。
+    if (budget) {
+        s_ui.status = WHALE_ST_BUDGET_HIT;
+    } else if (low) {
+        s_ui.status = WHALE_ST_BALANCE_LOW;
+    }
+}
+
+static bool fetch_balance_once(bool manual)
+{
+    static bool stack_reported;
+    char body[WHALE_BALANCE_BODY_MAX];
+    whale_fetch_result_t result = { 0 };
+
+    if (!whale_config_ready(&s_config)) {
+        s_ui.status = WHALE_ST_UNCONFIGURED;
+        publish_ui();
+        return false;
+    }
+    if (whale_net_state() != WHALE_NET_CONNECTED) {
+        s_ui.status = WHALE_ST_CONNECTING;
+        publish_ui();
+        return false;
     }
 
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
+    s_ui.status = WHALE_ST_REFRESHING;
+    publish_ui();
 
-    menu_refresh();
-    lv_screen_load(s_menu_scr);
+    const esp_err_t err = whale_net_fetch_balance(s_config.api_key, body, sizeof(body), &result);
+    if (!stack_reported) {
+        stack_reported = true;
+        ESP_LOGI(TAG, "网络任务栈水位线: %lu 字节剩余",
+                 (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+    }
+    if (err != ESP_OK) {
+        s_ui.status = WHALE_ST_NETWORK_FAILED;
+        publish_ui();
+        if (manual) play_sound(WHALE_SND_ERROR);
+        return false;
+    }
+    if (result.http_status == 401 || result.http_status == 403) {
+        s_ui.status = WHALE_ST_AUTH_FAILED;
+        publish_ui();
+        if (manual) play_sound(WHALE_SND_ERROR);
+        return false;
+    }
+    if (result.http_status != 200) {
+        s_ui.status = WHALE_ST_NETWORK_FAILED;
+        publish_ui();
+        if (manual) play_sound(WHALE_SND_ERROR);
+        return false;
+    }
+
+    whale_balance_t balance;
+    if (!whale_balance_extract(body, &balance)) {
+        s_ui.status = WHALE_ST_NETWORK_FAILED;
+        publish_ui();
+        if (manual) play_sound(WHALE_SND_ERROR);
+        return false;
+    }
+
+    // 记账:跨日/首次观测由模型自己判定。
+    char day[WHALE_DAY_LEN] = "";
+    whale_net_local_time(day, sizeof(day), NULL, NULL);
+
+    int64_t delta = 0;
+    const whale_ledger_event_t event = whale_ledger_observe(&s_ledger, day, balance.total_cents,
+                                                            &delta);
+
+    s_ui.has_balance = true;
+    s_ui.balance_cents = balance.total_cents;
+    s_ui.today_used_cents = s_ledger.used_cents;
+    s_ui.last_delta_cents = delta;
+    s_ui.status = WHALE_ST_ONLINE;
+
+    on_balance_event(event, delta);
+    check_thresholds();
+    publish_ui();
+    return true;
 }
 
-static void enter_menu(void) {
-    menu_build();
+// ---- 联网编排 --------------------------------------------------------------
+
+static void connect_and_refresh(void)
+{
+    if (!whale_config_ready(&s_config)) {
+        s_ui.status = WHALE_ST_UNCONFIGURED;
+        publish_ui();
+        return;
+    }
+
+    s_ui.status = WHALE_ST_CONNECTING;
+    publish_ui();
+
+    if (whale_net_sta_connect(s_config.ssid, s_config.password) != ESP_OK) {
+        s_ui.status = WHALE_ST_NETWORK_FAILED;
+        publish_ui();
+        return;
+    }
+    if (!whale_net_wait_connected(CONNECT_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "Wi-Fi 连接超时: %s", esp_err_to_name(whale_net_last_error()));
+        s_ui.status = WHALE_ST_NETWORK_FAILED;
+        publish_ui();
+        return;
+    }
+
+    // 连上了就响一声 —— 这是"名片已经上线"的听觉确认。
+    if (s_config.sound_connect) play_sound(WHALE_SND_CONNECT);
+    whale_net_sync_time(TIME_SYNC_TIMEOUT_MS);
+
+    s_ui.status = WHALE_ST_ONLINE;
+    publish_ui();
+    fetch_balance_once(false);
 }
 
-static demo_nav_input_t navigation_input(bsp_btn_t btn, bsp_btn_ev_t event) {
-    if (event == BSP_BTN_LONG && btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_LONG;
-    if (event != BSP_BTN_CLICK) return DEMO_NAV_INPUT_OTHER;
-    if (btn == BSP_BTN_UP) return DEMO_NAV_INPUT_UP_CLICK;
-    if (btn == BSP_BTN_DOWN) return DEMO_NAV_INPUT_DOWN_CLICK;
-    if (btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_CLICK;
-    return DEMO_NAV_INPUT_OTHER;
-}
+static void net_task(void *arg)
+{
+    (void)arg;
+    app_cmd_t cmd;
 
-static void process_input(const input_event_t *input) {
-    demo_nav_input_t nav_input = navigation_input(input->btn, input->event);
-
-    if (s_navigation.active >= 0) {
-        demo_nav_result_t result = demo_navigation_handle(&s_navigation, nav_input, true);
-        const demo_entry_t *demo = &DEMOS[result.index];
-        if (result.action == DEMO_NAV_ACTION_EXIT) {
-            esp_err_t e = demo->stop ? demo->stop() : ESP_OK;
-            if (e != ESP_OK) {
-                ESP_LOGE(TAG, "%s 页面停止失败: %s", demo->name, esp_err_to_name(e));
-                return;
+    for (;;) {
+        if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(500)) == pdTRUE) {
+            s_busy = true;
+            switch (cmd) {
+            case CMD_CONNECT:
+                connect_and_refresh();
+                break;
+            case CMD_REFRESH:
+                if (whale_net_state() != WHALE_NET_CONNECTED) {
+                    connect_and_refresh();
+                } else {
+                    fetch_balance_once(true);
+                }
+                break;
+            case CMD_CONFIG_SAVED:
+                whale_ui_provision_update(WHALE_PV_CONNECTING, NULL, NULL, NULL);
+                connect_and_refresh();
+                whale_ui_provision_update(whale_net_state() == WHALE_NET_CONNECTED
+                                              ? WHALE_PV_ONLINE : WHALE_PV_FAILED,
+                                          NULL, NULL, s_ui.ip);
+                break;
+            case CMD_PROV_START:
+                if (whale_prov_start(&s_config, on_form_saved, NULL) == ESP_OK) {
+                    whale_ui_provision_update(WHALE_PV_WAITING, whale_prov_ssid(),
+                                              whale_prov_password(), NULL);
+                    whale_ui_show_page(WHALE_PAGE_PROVISION);
+                }
+                break;
+            case CMD_PROV_STOP:
+                whale_prov_stop();
+                whale_ui_show_page(WHALE_PAGE_HOME);
+                break;
+            case CMD_CLEAR_CREDS:
+                whale_store_clear_credentials();
+                s_config.ssid[0] = '\0';
+                s_config.password[0] = '\0';
+                s_config.api_key[0] = '\0';
+                whale_net_sta_disconnect();
+                s_ui.ssid_preview[0] = '\0';
+                snprintf(s_ui.key_hint, sizeof(s_ui.key_hint), "none");
+                s_ui.has_balance = false;
+                s_ui.status = WHALE_ST_UNCONFIGURED;
+                publish_ui();
+                break;
+            default:
+                break;
             }
-            if (!bsp_lvgl_lock(500)) return;
-            demo->exit();
-            demo_navigation_complete_exit(&s_navigation);
-            enter_menu();
-            bsp_lvgl_unlock();
-        } else if (result.action == DEMO_NAV_ACTION_FORWARD) {
-            demo->key(input->btn, input->event);
+            s_busy = false;
         }
-        return;
-    }
 
-    if (nav_input == DEMO_NAV_INPUT_OTHER || nav_input == DEMO_NAV_INPUT_OK_LONG) return;
-    if (!bsp_lvgl_lock(500)) return;
-    demo_nav_result_t result = demo_navigation_handle(
-        &s_navigation, nav_input, s_ok[s_navigation.selected]);
-    if (result.action == DEMO_NAV_ACTION_REFRESH) {
-        menu_refresh();
-        ui_pixel_mascot_jump(s_mascot);
-    } else if (result.action == DEMO_NAV_ACTION_ENTER) {
-        const demo_entry_t *demo = &DEMOS[result.index];
-        ui_pixel_mascot_jump(s_mascot);
-        lv_obj_delete(s_menu_scr);
-        s_menu_scr = NULL;
-        s_mascot = NULL;
-        demo->enter();
-        bsp_lvgl_unlock();
-
-        esp_err_t e = demo->start ? demo->start() : ESP_OK;
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "%s 页面启动失败: %s", demo->name, esp_err_to_name(e));
+        // 自动刷新:只在已连接且不在配网时跑,间隔由设置项决定。
+        if (!whale_prov_running() && whale_config_ready(&s_config) &&
+            whale_net_state() == WHALE_NET_CONNECTED) {
+            const int64_t now = esp_timer_get_time();
+            const int64_t interval = (int64_t)s_config.refresh_sec * 1000 * 1000;
+            if (now - s_last_refresh_us >= interval) {
+                s_last_refresh_us = now;
+                s_busy = true;
+                fetch_balance_once(false);
+                s_busy = false;
+            }
         }
-        return;
     }
-    bsp_lvgl_unlock();
 }
 
-static void input_task(void *arg) {
+// ---- 配网表单回调 ----------------------------------------------------------
+
+static void on_form_saved(const whale_config_t *saved, void *user)
+{
+    (void)user;
+    if (saved == NULL) return;
+    s_config = *saved;
+    sync_credential_preview();
+    push_cmd(CMD_CONFIG_SAVED);
+}
+
+// ---- 设置页动作 ------------------------------------------------------------
+
+static void refresh_settings_view(void)
+{
+    whale_ui_settings_update(s_setting, s_config.refresh_sec, s_config.budget_cents,
+                             s_config.warn_cents, whale_peak_style_clamp(s_config.peak_style),
+                             whale_sleep_clamp((uint32_t)s_config.sleep_sec),
+                             s_config.sound_all,
+                             s_config.sound_press, s_config.sound_spend,
+                             s_config.sound_connect);
+}
+
+static void settings_activate(void)
+{
+    switch (s_setting) {
+    case WHALE_SET_PROVISION:
+        play_sound(WHALE_SND_CLICK);
+        push_cmd(CMD_PROV_START);
+        break;
+    case WHALE_SET_REFRESH:
+        s_config.refresh_sec = whale_refresh_next(s_config.refresh_sec);
+        whale_store_save_config(&s_config);
+        s_ui.refresh_sec = s_config.refresh_sec;
+        play_sound(WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_BUDGET:
+        s_config.budget_cents = whale_budget_next(s_config.budget_cents);
+        whale_store_save_config(&s_config);
+        s_budget_hit = false;      // 换了阈值就重新计一次"是否已经提示过"
+        play_sound(WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_WARN:
+        s_config.warn_cents = whale_warn_next(s_config.warn_cents);
+        whale_store_save_config(&s_config);
+        s_warn_hit = false;
+        play_sound(WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_PEAK_STYLE:
+        s_config.peak_style = whale_peak_style_next(whale_peak_style_clamp(s_config.peak_style));
+        whale_store_save_config(&s_config);
+        s_ui.peak_style = whale_peak_style_clamp(s_config.peak_style);
+        play_sound(WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_SOUND_ALL:
+        s_config.sound_all = !s_config.sound_all;
+        whale_store_save_config(&s_config);
+        // 这里刻意不走 play_sound():总开关刚打开时应当立刻响一声确认。
+        if (s_config.sound_all) whale_audio_play(WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_SOUND_PRESS:
+        s_config.sound_press = !s_config.sound_press;
+        whale_store_save_config(&s_config);
+        play_sound(s_config.sound_press ? WHALE_SND_PRESS : WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_SOUND_SPEND:
+        s_config.sound_spend = !s_config.sound_spend;
+        whale_store_save_config(&s_config);
+        play_sound(s_config.sound_spend ? WHALE_SND_COIN : WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_SOUND_CONNECT:
+        s_config.sound_connect = !s_config.sound_connect;
+        whale_store_save_config(&s_config);
+        play_sound(s_config.sound_connect ? WHALE_SND_CONNECT : WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_SLEEP:
+        s_config.sleep_sec =
+            (int64_t)whale_sleep_next(whale_sleep_clamp((uint32_t)s_config.sleep_sec));
+        whale_store_save_config(&s_config);
+        // 改档位也走一次按键路径,空闲计时已经被 handle_input 清零了:
+        // 否则从 100 秒切到 300 秒的瞬间可能已经"超时",当场睡过去。
+        play_sound(WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_LEDGER:
+        // 只清当日累计,不动 Wi-Fi 与 API Key。
+        s_ledger.used_cents = 0;
+        s_ledger.topup_cents = 0;
+        s_ledger.last_cents = s_ui.balance_cents;
+        s_ui.today_used_cents = 0;
+        s_budget_hit = false;
+        whale_store_save_ledger(&s_ledger);
+        play_sound(WHALE_SND_CLICK);
+        break;
+    case WHALE_SET_BACK:
+        play_sound(WHALE_SND_CLICK);
+        whale_ui_show_page(WHALE_PAGE_HOME);
+        break;
+    default:
+        break;
+    }
+    refresh_settings_view();
+}
+
+// ---- 空闲与休眠 ------------------------------------------------------------
+
+static void mark_activity(void)
+{
+    s_last_activity_us = esp_timer_get_time();
+    if (s_dimmed) {
+        bsp_display_backlight(100);
+        s_dimmed = false;
+    }
+}
+
+static void enter_deep_sleep(void)
+{
+    ESP_LOGI(TAG, "空闲超时,准备进入 deep sleep");
+    whale_ui_sleep_notice();
+
+    whale_audio_stop();     // 音频任务持有 I2S,必须先停
+    s_ready = false;
+
+    const int mv = bsp_button_read_mv();
+    if (mv >= 0 && mv < BSP_BTN_MV_RELEASED_MIN) {
+        ESP_LOGW(TAG, "按键被按住(%d mV),本次不入睡", mv);
+        s_ready = true;
+        s_last_activity_us = esp_timer_get_time();
+        publish_ui();
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(400));
+
+    int level = 0;
+    if (bsp_button_prepare_deep_sleep(&level) != ESP_OK) {
+        ESP_LOGE(TAG, "按键交回失败,重启恢复外设");
+        esp_restart();
+    }
+    // 第一个参数是位掩码,不是引脚号。
+    if (esp_deep_sleep_enable_gpio_wakeup(1ULL << BSP_BTN_GPIO,
+                                          ESP_GPIO_WAKEUP_GPIO_LOW) != ESP_OK) {
+        ESP_LOGW(TAG, "按键唤醒源武装失败,重启恢复外设");
+        esp_restart();
+    }
+
+    // Wi-Fi 与 NTP 先收尾,再关其它外设。
+    whale_net_prepare_deep_sleep();
+    if (bsp_battery_sleep() != ESP_OK) ESP_LOGW(TAG, "电量计 suspend 未确认");
+    if (bsp_audio_sleep() != ESP_OK) ESP_LOGW(TAG, "codec suspend 未确认");
+    if (bsp_audio_prepare_deep_sleep() != ESP_OK) ESP_LOGW(TAG, "I2S 引脚释放失败");
+    if (bsp_i2c_prepare_deep_sleep() != ESP_OK) ESP_LOGW(TAG, "I2C 引脚释放失败");
+
+    if (!bsp_lvgl_lock(1000)) {
+        ESP_LOGE(TAG, "无法停住 LVGL 刷屏,重启恢复外设");
+        esp_restart();
+    }
+    if (bsp_display_prepare_deep_sleep() != ESP_OK) {
+        ESP_LOGW(TAG, "屏幕 suspend 未确认(仍会入睡)");
+    }
+    esp_deep_sleep_start();
+    ESP_LOGE(TAG, "esp_deep_sleep_start 意外返回,重启");
+    esp_restart();
+}
+
+static void service_idle(void)
+{
+    if (s_sleeping) return;
+    const int64_t now = esp_timer_get_time();
+
+    if (now - s_last_battery_us >= BATTERY_REFRESH_US) {
+        s_last_battery_us = now;
+        s_ui.battery = bsp_battery_soc();
+        whale_ui_battery_refresh();
+    }
+
+    // 熄屏设为「关闭」时既不调暗也不休眠:屏幕一直亮着,等用户自己按键。
+    const uint32_t sleep_sec = whale_sleep_clamp((uint32_t)s_config.sleep_sec);
+    if (sleep_sec == WHALE_SLEEP_OFF) return;
+
+    const int64_t idle = now - s_last_activity_us;
+    // 先把背光压到最低,再入睡 —— 给人一个"快要睡了"的提示。
+    if (!s_dimmed && idle >= (int64_t)sleep_sec * 1000 * 1000 / IDLE_DIM_DIVISOR) {
+        bsp_display_backlight(8);
+        s_dimmed = true;
+    }
+    // 配网/联网进行中不睡:用户正在读屏幕上的热点信息,或正在等余额。
+    if (idle >= (int64_t)sleep_sec * 1000 * 1000 && !s_busy && !whale_prov_running()) {
+        s_sleeping = true;
+        enter_deep_sleep();
+    }
+}
+
+// ---- 输入 ------------------------------------------------------------------
+
+// 泡泡序列推进:走到最后一项后再按一次就收起泡泡(挂件的"最后一项再点收起")。
+// 收起状态下再按一次 → 从第一项重新开始。
+static void bubble_advance(void)
+{
+    if (!s_bubble_open) {
+        s_bubble_open = true;
+        s_ui.view = 0;
+    } else if (s_ui.view >= WHALE_VIEW_COUNT - 1) {
+        s_bubble_open = false;
+    } else {
+        s_ui.view = (s_ui.view + 1) % WHALE_VIEW_COUNT;
+    }
+    s_ui.bubble_open = s_bubble_open;
+}
+
+static void bubble_step(int direction)
+{
+    if (!s_bubble_open) {
+        s_bubble_open = true;
+        s_ui.view = 0;
+    } else {
+        s_ui.view = (s_ui.view + direction + WHALE_VIEW_COUNT) % WHALE_VIEW_COUNT;
+    }
+    s_ui.bubble_open = s_bubble_open;
+}
+
+static void handle_input(const input_event_t *input)
+{
+    mark_activity();
+    if (input->event != BSP_BTN_CLICK && input->event != BSP_BTN_LONG) return;
+
+    const whale_page_t page = whale_ui_current_page();
+
+    // 长按是主交互通道:唤菜单、返回、刷新、试听、清除凭据都由长按承担。
+    if (input->event == BSP_BTN_LONG) {
+        if (page == WHALE_PAGE_HOME) {
+            if (input->btn == BSP_BTN_OK) {
+                press_cue();
+                refresh_settings_view();
+                whale_ui_show_page(WHALE_PAGE_SETTINGS);
+            } else if (input->btn == BSP_BTN_UP) {
+                press_cue();
+                push_cmd(CMD_REFRESH);              // 长按上 = 立刻取一次余额
+            } else {
+                press_cue();
+                // 长按下 = 试听消费音效(挂件每个音效行都带「试听」)
+                play_sound(s_config.sound_spend ? WHALE_SND_COIN : WHALE_SND_BELL);
+                whale_ui_coin_drop();
+            }
+            return;
+        }
+
+        if (page == WHALE_PAGE_SETTINGS) {
+            if (input->btn == BSP_BTN_OK) {
+                press_cue();
+                whale_ui_show_page(WHALE_PAGE_HOME);
+            } else if (input->btn == BSP_BTN_UP && s_setting == WHALE_SET_PROVISION) {
+                // 危险操作必须长按:清掉已存的 Wi-Fi 与 API Key。
+                press_cue();
+                push_cmd(CMD_CLEAR_CREDS);
+            } else {
+                press_cue();
+            }
+            return;
+        }
+
+        if (input->btn == BSP_BTN_OK) {
+            press_cue();
+            push_cmd(CMD_PROV_STOP);
+        }
+        return;
+    }
+
+    if (page == WHALE_PAGE_HOME) {
+        // 挂件页短按 = 按压鲸鱼,先给「小黄鸭·按下」再推进泡泡序列。
+        press_cue();
+        if (input->btn == BSP_BTN_OK) {
+            bubble_advance();
+        } else if (input->btn == BSP_BTN_UP) {
+            bubble_step(-1);
+        } else {
+            bubble_step(1);
+        }
+        publish_ui();
+        return;
+    }
+
+    if (page == WHALE_PAGE_SETTINGS) {
+        if (input->btn == BSP_BTN_OK) {
+            settings_activate();       // 各菜单项自己决定响什么音
+            return;
+        }
+        play_sound(WHALE_SND_CLICK);
+        if (input->btn == BSP_BTN_UP) {
+            s_setting = (whale_setting_t)((s_setting + WHALE_SET_COUNT - 1) % WHALE_SET_COUNT);
+        } else {
+            s_setting = (whale_setting_t)((s_setting + 1) % WHALE_SET_COUNT);
+        }
+        refresh_settings_view();
+        return;
+    }
+
+    // 配网页:短按确定 = 用已保存凭据再连一次。
+    play_sound(WHALE_SND_CLICK);
+    if (input->btn == BSP_BTN_OK) push_cmd(CMD_CONNECT);
+}
+
+static void input_task(void *arg)
+{
     (void)arg;
     input_event_t input;
     for (;;) {
-        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) == pdTRUE) {
-            process_input(&input);
+        if (xQueueReceive(s_input_queue, &input, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            handle_input(&input);
         }
+        service_idle();
     }
 }
 
-static esp_err_t input_dispatch_init(void) {
-    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
-    if (!s_input_queue) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(input_task, "demo_input", 4096, NULL, 5, &s_input_task) != pdPASS) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-static void input_dispatch_deinit(void) {
-    s_input_ready = false;
-    if (s_input_task) {
-        vTaskDelete(s_input_task);
-        s_input_task = NULL;
-    }
-    if (s_input_queue) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-    }
-}
-
-// Waking from deep sleep by key reboots the chip while that key is still held: the
-// button component starts a few hundred milliseconds later, registers a press that
-// is already down, and grades it a long press once it has been down for its
-// threshold (500 ms here), so an unintended action fires almost immediately. Drop
-// key actions until that press comes up; the deadline is only a safety net so a
-// stuck key cannot leave the pad dead. The state machine lives in key_guard.h so it
-// can be unit-tested without the rest of the demo.
-#define KEY_GUARD_MAX_US (10LL * 1000 * 1000)
-static key_guard_t s_key_guard;
-
-// button callbacks run on the shared esp_timer task; enqueue only and return immediately.
-static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
+// 按键回调运行在共享 esp_timer 任务上:只入队。
+static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
+{
     (void)user;
-    // Consume the guard before the readiness check: a release can arrive after the
-    // post-init voltage sample but before input dispatch is ready, and dropping it
-    // here would leave the guard armed to swallow the next real press.
     const bool was_armed = s_key_guard.armed;
     if (key_guard_consume(&s_key_guard, ev == BSP_BTN_RELEASE, esp_timer_get_time())) {
-        // The release and the deadline both arrive on this task; log the disarm
-        // transition once it happens.
         if (was_armed && !s_key_guard.armed) {
             ESP_LOGI(TAG, "唤醒键已松手,按键恢复响应");
         }
         return;
     }
-    if (!s_input_ready || !s_input_queue) return;
+    if (!s_ready || s_input_queue == NULL) return;
     const input_event_t input = { .btn = btn, .event = ev };
     (void)xQueueSend(s_input_queue, &input, 0);
 }
 
-void app_main(void) {
-    ESP_LOGI(TAG, "FoloToy AI Passport BSP demo 启动");
+// ---- 启动 ------------------------------------------------------------------
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "FoloToy AI Passport · 小鲸鱼计费名片 启动");
+
     const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
-    if (wake_causes & ~(1u << ESP_SLEEP_WAKEUP_UNDEFINED)) {
-        ESP_LOGI(TAG, "休眠唤醒原因位图: 0x%02x", (unsigned)wake_causes);
-    }
-    // 按键唤醒时,那颗键在整个启动期间还按着。先挡住它的动作(见 on_key)。
     if (wake_causes & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
         key_guard_arm(&s_key_guard, esp_timer_get_time(), KEY_GUARD_MAX_US);
         ESP_LOGI(TAG, "按键唤醒:先屏蔽按键动作,直到那颗键松手");
@@ -229,51 +733,92 @@ void app_main(void) {
     bsp_i2c_init();
     bsp_i2c_scan();
 
-    // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-    // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
-    if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-        ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
+    if (bsp_display_init() != ESP_OK || bsp_lvgl_init() == NULL) {
+        ESP_LOGE(TAG, "显示/LVGL 初始化失败,无法运行。"
                       "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
                  BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
         return;
     }
     bsp_display_backlight(100);
 
-    demo_navigation_init(&s_navigation, DEMO_COUNT);
+    if (whale_net_init() != ESP_OK) {
+        ESP_LOGE(TAG, "网络栈初始化失败,仅离线显示");
+    }
 
-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
-    s_ok[0] = true;                                   // Display 已确认可用
-    esp_err_t input_err = input_dispatch_init();
-    esp_err_t button_err = input_err == ESP_OK
-                         ? bsp_button_init(on_key, NULL)
-                         : ESP_ERR_INVALID_STATE;
-    s_ok[1] = input_err == ESP_OK && button_err == ESP_OK;
-    if (input_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键事件任务创建失败: %s", esp_err_to_name(input_err));
-    } else if (button_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键初始化失败: %s", esp_err_to_name(button_err));
-        input_dispatch_deinit();
-    } else if (s_key_guard.armed) {
-        // 若唤醒键在按键驱动启动前就已松手,组件不会产生 release 事件,守卫会一直
-        // 拦到兜底。初始化完成后按真实电压同步一次:已松手立即撤防。
+    whale_config_init(&s_config);
+    if (!whale_store_load_config(&s_config)) {
+        ESP_LOGI(TAG, "没有已保存的配置,等待配网");
+    } else {
+        ESP_LOGI(TAG, "读到配置:SSID=%s 刷新=%lus Key=%s", s_config.ssid,
+                 (unsigned long)s_config.refresh_sec,
+                 s_config.api_key[0] != '\0' ? "已设置" : "空");
+    }
+    if (!whale_store_load_ledger(&s_ledger)) {
+        whale_ledger_reset(&s_ledger, "");
+        ESP_LOGI(TAG, "没有账本,从本次观测开始记账");
+    } else {
+        ESP_LOGI(TAG, "读到账本:%s 已用 %lld 分", s_ledger.day, (long long)s_ledger.used_cents);
+    }
+
+    // 界面状态初值。
+    memset(&s_ui, 0, sizeof(s_ui));
+    s_ui.battery = -1;
+    s_ui.status = whale_config_ready(&s_config) ? WHALE_ST_CONNECTING : WHALE_ST_UNCONFIGURED;
+    s_ui.today_used_cents = s_ledger.used_cents;
+    s_ui.refresh_sec = s_config.refresh_sec;
+    sync_credential_preview();
+    snprintf(s_ui.updated, sizeof(s_ui.updated), "--:--");
+
+    if (!whale_ui_init()) {
+        ESP_LOGE(TAG, "界面创建失败");
+        return;
+    }
+    publish_ui();
+
+    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
+    s_cmd_queue = xQueueCreate(CMD_QUEUE_DEPTH, sizeof(app_cmd_t));
+    if (s_input_queue == NULL || s_cmd_queue == NULL) {
+        ESP_LOGE(TAG, "队列创建失败");
+        return;
+    }
+    if (xTaskCreate(input_task, "whale_input", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "输入任务创建失败");
+        return;
+    }
+    // HTTPS(mbedTLS + 证书包)握手很吃栈:这个任务按 12 KB 开,并在首次请求后
+    // 打一次水位线,便于真机核对余量。
+    if (xTaskCreate(net_task, "whale_net", 12288, NULL, 5, &s_net_task) != pdPASS) {
+        ESP_LOGE(TAG, "网络任务创建失败");
+        return;
+    }
+
+    if (bsp_button_init(on_key, NULL) != ESP_OK) {
+        ESP_LOGE(TAG, "按键初始化失败");
+        return;
+    }
+    if (s_key_guard.armed) {
         const bool released = bsp_button_read_mv() >= BSP_BTN_MV_RELEASED_MIN;
         key_guard_sync_released(&s_key_guard, released);
-        if (!s_key_guard.armed) {
-            ESP_LOGI(TAG, "唤醒键在按键驱动启动前已松手,提前撤防");
-        }
-    }
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
-    s_ok[5] = true;
-    s_ok[6] = true;
-
-    if (bsp_lvgl_lock(1000)) {
-        enter_menu();
-        bsp_lvgl_unlock();
-        s_input_ready = true;
     }
 
-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
+    if (bsp_battery_init() != ESP_OK) {
+        ESP_LOGW(TAG, "电量计不可用,右上角显示 --");
+    }
+    s_ui.battery = bsp_battery_soc();
+    whale_ui_battery_refresh();
+
+    if (!whale_audio_start()) ESP_LOGW(TAG, "音效不可用,静音运行");
+
+    const int64_t now = esp_timer_get_time();
+    s_last_activity_us = now;
+    s_last_battery_us = now;
+    s_last_refresh_us = now;
+    s_ready = true;
+
+    // 有配置就自动连一次;没配置停在"未配网",等用户长按进设置。
+    if (whale_config_ready(&s_config)) {
+        push_cmd(CMD_CONNECT);
+    } else {
+        ESP_LOGI(TAG, "等待配网:长按确定键进设置 → 配网与 API Key");
+    }
 }

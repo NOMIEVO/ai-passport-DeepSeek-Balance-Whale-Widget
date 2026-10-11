@@ -20,6 +20,11 @@
 - [ai-guide.zh_CN.md](ai-guide.zh_CN.md)：AI 开发工作流（面向 AI 编程助手：上下文建立、需求拆解、BSP 边界、验收交付格式）。
 - [核心 AI 技能](../../skills/README.zh_CN.md)：开发、环境准备、构建、真机测试及诊断，包含安装和使用示例。
 
+## 应用（applications）
+
+- [game-2048.md](applications/game-2048.md)：离线 2048 游戏——竖屏界面、三键方向轮盘、NVS 续玩、合成音效与空闲深度睡眠。
+- [deepseek-balance-whale.zh_CN.md](applications/deepseek-balance-whale.zh_CN.md)：小鲸鱼计费名片——DeepSeek 余额挂件、网页配网填 API Key、代码绘制鲸鱼、金币消费音效与跨日记账。
+
 ## 工程约定（engineering）
 
 - [game-demo-to-device-acceptance.zh_CN.md](engineering/game-demo-to-device-acceptance.zh_CN.md)：共享 C/Wasm 游戏逻辑，先验收网页玩法，再验收真机表现。

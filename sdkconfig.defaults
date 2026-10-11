@@ -22,23 +22,38 @@ CONFIG_LV_COLOR_DEPTH_16=y
 # 20 ms display refresh period targets up to 50 FPS when rendering and SPI
 # transfer complete within the same budget.
 CONFIG_LV_DEF_REFR_PERIOD=20
+# 本应用不直接用 Montserrat(中文与数字都走自建子集),只保留 LVGL 默认的 14。
 CONFIG_LV_FONT_MONTSERRAT_14=y
-CONFIG_LV_FONT_MONTSERRAT_20=y
-# LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
-# 本 demo UI 简单,24KB 足够;若自建复杂界面出现绘制卡死/看门狗,调大此值。
-CONFIG_LV_MEM_SIZE_KILOBYTES=24
+# LVGL 分配器:改用系统堆的 malloc/realloc/free,不再用 LVGL 自带的 TLSF 静态池。
+# 踩过的坑:静态池一旦不够,lv_tlsf.c 的 block_locate_free 会进入死循环 —— 表现是
+# 开机后 main 任务被任务看门狗每 5s 报警一次、界面完全卡住。48KB 在加角色图后爆过,
+# 扩到 96KB 又撑住了,但加上气泡图(199x174)后再爆 —— 说明"每次加图就扩容"是治标。
+# 改走系统堆:RAM 余量更大、不够时返回 NULL 而不是死循环,彻底消除这个坑。
+CONFIG_LV_USE_CLIB_MALLOC=y
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
 
+# --- 联网(小鲸鱼计费名片)---
+# 取余额走 HTTPS,用 IDF 自带根证书包校验,不在固件里硬编码单个 CA。
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# 没有 PSRAM:mbedTLS 用动态缓冲把峰值堆占用压下来。
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+# Wi-Fi 只做 2.4GHz STA + 配网用的 SoftAP,关掉不需要的东西省 RAM。
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+# 配网网页/httpd(URI handler 数量在代码里配,这里只调缓冲)
+# 手机/PC 浏览器的请求头(User-Agent + Accept* + sec-ch-ua 等)很容易超过 512 B,
+# 一旦超了 httpd 直接回 "Header fields are too long",所以这里给到 2 KB。
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+CONFIG_HTTPD_MAX_URI_LEN=512
+CONFIG_HTTPD_PURGE_BUF_LEN=64
+# SNTP 只用一个服务器(北京时间)
+CONFIG_LWIP_SNTP_MAX_SERVERS=1
+
 # --- Bluetooth LE / NimBLE ---
-# ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
-CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=n
-CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# 本应用不用 BLE(配网走 SoftAP 网页),关掉以省 Flash 与 RAM。
+CONFIG_BT_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=n

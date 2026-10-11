@@ -15,6 +15,44 @@
 - 添加字库前评估 Flash 与内部 RAM 影响；ESP32-C3 无 PSRAM。
 - 不提交许可不允许分发的字库。
 
+### `fonts/game2048_font_16.c`
+
+| 项目 | 内容 |
+| --- | --- |
+| 用途 | `main/` 中 2048 应用的中文界面文本，名义字级 16 px。 |
+| 来源字体 | [Noto Sans CJK SC Regular](https://github.com/notofonts/noto-cjk)（`Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf`），SIL Open Font License 1.1，允许再分发。 |
+| 字符范围 | ASCII `0x20`–`0x7E`，加上 [`fonts/game2048_symbols.txt`](fonts/game2048_symbols.txt) 列出的 50 个汉字。 |
+| 转换命令 | `lv_font_conv --font NotoSansCJKsc-Regular.otf -r 0x20-0x7E --symbols "$(cat assets/fonts/game2048_symbols.txt)" --size 16 --bpp 4 --format lvgl --no-compress --lv-font-name game2048_font_16 --lv-include lvgl.h -o assets/fonts/game2048_font_16.c` |
+| 集成方式 | 由 `main/CMakeLists.txt` 通过 `target_sources()` 编译；在 `main/g2048_ui.c` 里用 `LV_FONT_DECLARE(game2048_font_16)` 声明并显式绑定到控件。 |
+| 开销 | 145 个字形，4 bpp 未压缩；位图约 9.5 KB，存放在只读 Flash。 |
+| 度量 | `line_height` 为 20 px、`base_line` 为 5 px —— 排版按每行 20 px 预留，不是 16 px。 |
+
+为什么要自建子集：Montserrat 不含汉字，而 LVGL 内置的
+`lv_font_source_han_sans_sc_16_cjk` 覆盖的是一批与本界面完全无关的生僻字。
+给界面加中文是字库工程，不是把字符串改成 UTF-8 就够了。
+
+覆盖情况由 `tools/check_app_font_coverage.py` 把关，它属于静态门禁：解析生成的
+cmap 表、核对字符清单与 `main/g2048_ui.c` 里的每一个字符串字面量，并检查字形度量
+是否合理。界面文案一变，就要重新生成字库并重跑这个检查。
+
+### `fonts/whale_ui_font_16.c` / `fonts/whale_ui_font_24.c`
+
+| 项目 | 内容 |
+| --- | --- |
+| 用途 | `main/whale_ui.c`（小鲸鱼计费名片）的中文界面文本：16 px 用于正文，24 px 用于泡泡卡主数值。 |
+| 来源字体 | [Noto Sans CJK SC Regular](https://github.com/notofonts/noto-cjk)（`Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf`），SIL Open Font License 1.1，允许再分发。 |
+| 字符范围 | ASCII `0x20`–`0x7E`，加上 [`fonts/whale_ui_font_symbols.txt`](fonts/whale_ui_font_symbols.txt) 列出的 139 个非 ASCII 码位（含 `¥`、`·`、`…`）。 |
+| 转换命令 | `python3 tools/gen_whale_font.py`（内部按两个字号分别调用 `lv_font_conv`，字表由扫描 `main/whale_ui.c` 的字符串字面量得到）。 |
+| 集成方式 | 由 `main/CMakeLists.txt` 通过 `target_sources()` 编译；在 `main/whale_ui.c` 里用 `LV_FONT_DECLARE()` 声明并显式绑定到控件。 |
+| 开销 | 每级 234 个字形，4 bpp 未压缩；位图存放在只读 Flash（16 px 约 14 KB，24 px 约 28 KB）。 |
+| 度量 | 16 px：`line_height` 20、`base_line` 5；24 px：`line_height` 29、`base_line` 7。排版按这些值预留行高。 |
+
+覆盖情况由 `tools/check_whale_font_coverage.py` 把关（同样是静态门禁）：**两个字号**
+都要能画出字表与界面文案里的每个字，并检查汉字字形尺寸是否合理。
+
+动态文本（SSID、IP、时间）不进字表，一律经 `whale_text_ascii_preview()` 压成 ASCII
+预览后再显示：设备字库是按固定文案做的子集，盖不住任意汉字。
+
 ## 图片（images）
 
 可复用的源图与生成的显示资产放在 `images/`。
