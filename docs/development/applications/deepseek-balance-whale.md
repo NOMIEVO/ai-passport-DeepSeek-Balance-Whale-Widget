@@ -399,7 +399,7 @@ sound switch silences all of them.
 
 ## On-device record (2026-10-10)
 
-- Target: COM3, ESP32-C3 (QFN32) rev v1.1, embedded 8 MB flash, MAC `4c:11:ae:2f:e1:68`
+- Target: COM3, ESP32-C3 (QFN32) rev v1.1, embedded 8 MB flash (device serial omitted)
 - Flash: `esptool write_flash 0x0 FoloToy-AI-Passport-full.bin` → 1,655,504 B written,
   `Hash of data verified.`, board rebooted on its own
 - Boot log after reset (15 s window, raw kept outside the repo at
@@ -417,6 +417,340 @@ sound switch silences all of them.
 | Codec opened at **16 kHz / 16 bit / 1 ch** | PASS, matches the synthesized PCM |
 | No credentials yet → waits for provisioning | PASS, as designed |
 | No panic / watchdog reset within 15 s | PASS |
+
+## 18th firmware (performance: stage shrink + 30 fps cap + FPS overlay, sha256 `763231d4…8831cb`)
+
+First pass at fixing the "janky animation" report. Diagnosis: **the frame budget was
+not misconfigured — a single frame simply could not finish inside 20 ms.**
+
+| Change | Detail |
+| --- | --- |
+| Stage shrink | `stage` went from `240 x 139` to `139 x 139`, aligned to the character's top-left (x=95); per-frame redraw 33,360 -> **19,321 px, -42%** (the 95 px of blank space on the left used to be scaled and redrawn every frame) |
+| Pivot fix | It sat at x=120 (screen centre) while the character centre is 164.5, so the character drifted sideways while scaling; now it is exactly the foot centre |
+| Refresh period | `LV_DEF_REFR_PERIOD` 20 -> **33 ms**. Chasing 50 fps that cannot hold is worse than locking 30 fps: steady spacing = even motion = no judder |
+| Diagnostics | Enabled `LV_USE_SYSMON` + `LV_USE_PERF_MONITOR` for a live FPS/CPU readout in the bottom-right corner (note: the latter depends on the former) |
+
+Measured after flashing: **still only about 8 frames per press (~13 fps)** — so the
+bottleneck was not redraw area but the **object-level transform layer** fixed in the
+19th firmware below.
+
+## 19th firmware (root fix: scale the image itself, sha256 `90381305…9bb1c`)
+
+Following the FPS overlay from the 18th build into the LVGL sources,
+`lv_obj_get_layer_type()` in `lv_obj_style.c` exposes the culprit:
+
+```c
+if(lv_obj_get_style_transform_scale_x(obj, LV_PART_MAIN) != 256) return LV_LAYER_TYPE_TRANSFORM;
+if(lv_obj_get_style_transform_scale_y(obj, LV_PART_MAIN) != 256) return LV_LAYER_TYPE_TRANSFORM;
+```
+
+**Any object carrying `transform_scale_*` != 256 is tagged `LV_LAYER_TYPE_TRANSFORM`,
+so LVGL must, every single frame: (1) allocate an ARGB8888 intermediate layer
+(139x139 = 77 KB, squeezed out of internal RAM because the C3 has no PSRAM),
+(2) render the character into that layer, (3) matrix-transform the layer onto the
+screen, and (4) free it.** That is why 0.6 s produced only 8 frames.
+
+| Change | Detail |
+| --- | --- |
+| Scale a different thing | `lv_obj_set_style_transform_scale_*(stage)` -> **`lv_image_set_scale_x/y(whale_img)`**. The image's own transform goes through the draw unit's transform blit and needs **no intermediate layer** |
+| Dropped the stage container | The character container is parented straight to the screen and only positions things; nothing carries a transform any more |
+| Overshoot must survive clipping | Container gets `LV_OBJ_FLAG_OVERFLOW_VISIBLE` — the spring-back overshoot to 1.05 paints about 7 px outside it |
+| Pivot | `lv_image_set_pivot(img, 69, 139)` = foot centre, equivalent to the widget's `transform-origin:50% 100%` |
+
+Feel parameters are unchanged (squash 180 ms / spring back 420 ms / 2.4 s breathing
+half period).
+
+| Observation | Result |
+| --- | --- |
+| `idf.py build` | PASS, `Project build complete`, no warnings |
+| `esptool write_flash 0x0` wrote 1,843,504 B (960,672 B compressed), `Hash of data verified.` | PASS, 6.7 s @ 460800 |
+| 25 s serial window: no watchdog / no panic | PASS |
+| Gates: `verify_firmware` / `check_repo` (375 files) / font coverage (163 chars) / archive | all PASS, archived at `build/firmware/90381305…9bb1c/` |
+| App size 1,777,968 B | PASS, 79% of the partition free |
+
+Note: this build still carries the bottom-right FPS overlay (diagnostics only). Before
+a release build, comment out `CONFIG_LV_USE_SYSMON` and
+`CONFIG_LV_USE_PERF_MONITOR` and rebuild.
+
+## 20th firmware (fixing the frame drop while swapping the bubble, sha256 `5127a6c4…fde0`)
+
+After the 19th build the user reported: **static frame rate clearly improved, but
+swapping the bubble still drops to about 15 fps.**
+
+Working out the per-frame redraw volume matches the size of the drop:
+
+| Scenario | Pixels handled per frame | Measured |
+| --- | --- | --- |
+| Idle (breathing loop only) | character 139x139 ~= **19,321** | ~30 fps OK |
+| Swapping the bubble | bubble layer **240x177 ~= 42,480** + character 19,321 ~= **61,800** | ~15 fps poor |
+
+A move animation's dirty area is "old position union new position", so **layer width
+directly sets the per-frame pixel count**. The bubble layer was the full 240 px wide
+while the bubble art is only 194 px — 16 px and 30 px of blank margins were being
+repainted every frame. Worse, the bubble layer (y 28..202) **overlaps the character
+(y 123..262) by 79 px**, so each bubble repaint also redoes the scaling transform
+plus alpha blending for the overlapping part of the character.
+
+| Change | Detail |
+| --- | --- |
+| Bubble layer shrink | `BUB_LAYER_X` 0 -> `BUB_IMG_X` (16), `BUB_LAYER_W` 240 -> `BUB_IMG_W` (194); wraps only the art, no blank margins (-19%) |
+| Child coordinates follow | bubble art sits at (0,0) inside the layer; the three text rows use `BUB_TEXT_X - BUB_LAYER_X`, so on-screen position is unchanged |
+| Character holds still during a swap | `bubble_swap_content()` starts with `lv_anim_delete(whale_img, squash_exec_cb)` to stop the breathing loop — removes one 139x139 scaled redraw per frame (-31%); `bubble_in_done_cb` restarts it once the enter animation finishes |
+| Conflict guard | New `s_squash_boing_active`: while a key-press bounce is still running, a finished bubble enter does **not** restart breathing, so the two animations never fight over the same property; the bounce's own spring-back callback reattaches it |
+
+Combined, per-frame pixel volume drops 61,800 -> about 34,300 (**-44%**), which should
+land around 25 fps.
+
+| Observation | Result |
+| --- | --- |
+| `idf.py build` | PASS, `Project build complete`, no warnings |
+| `esptool write_flash 0x0` wrote 1,843,600 B (960,781 B compressed), `Hash of data verified.` | PASS, 6.7 s @ 460800 |
+| 22 s serial window: no watchdog / no panic | PASS |
+| Gates: `verify_firmware` / `check_repo` (375 files) / font coverage (163 chars) / archive | all PASS, archived at `build/firmware/5127a6c4…fde0/` |
+| App size 1,778,064 B | PASS, 79% of the partition free |
+
+Note: this build still carries the FPS overlay. Once the swap animation frame rate is
+confirmed, turn the two SYSMON options off and cut a release build.
+
+## 21st firmware (fixing the "character stopped moving" regression, sha256 `afe1b07d…ef8f`)
+
+After flashing the 20th build, the user reported: **the character stopped moving
+entirely** — no idle breathing, and no bounce on key press either.
+
+**Root cause: two animations shared one exec_cb, so one delete killed both.**
+
+- `lv_anim_delete(var, exec_cb)` matches **exactly** on the exec_cb;
+- and **`lv_anim_delete()` never calls `completed_cb`**.
+
+The 20th build had "idle breathing" and "key bounce" sharing `squash_exec_cb`, while a
+short OK press runs:
+
+```text
+handle_input
+  ├─ press_cue()      -> whale_ui_boing()   starts the press leg (180ms), sets active = true
+  └─ bubble_advance() -> publish_ui()
+       └─ whale_ui_update() sees the view changed
+            └─ bubble_swap_content()
+                 └─ lv_anim_delete(whale_img, squash_exec_cb)   // kills the press leg too
+```
+
+Kill the press leg -> its completed_cb never runs -> **the back (spring) leg never
+starts** -> its completed_cb never runs either -> `s_squash_boing_active` sticks at
+`true` -> idle breathing never comes back -> the character is frozen for good.
+
+| Change | Note |
+| --- | --- |
+| Split into two callbacks | `idle_exec_cb` (breathing) / `boing_exec_cb` (press + back legs); both call `squash_apply()` |
+| New `idle_stop()` | **Stops breathing only, never the bounce** — this is the actual fix |
+| New `idle_resume()` | Paired design: only resumes if it was really paused, so a later animation cannot clobber the shared flag |
+| Swap is now conditional | While a bounce is running it **does not touch anything** (no resume flag); the bounce's spring-back callback reconnects breathing. It only pauses when no bounce is in flight |
+| Closing now resumes too | `bubble_out_done_cb` calls `idle_resume()` — closing is a single leg with no enter leg to hand off to |
+| `bubble_play_in()` lost its parameter | The resume flag is now set by the caller, avoiding shared state being overwritten |
+
+The 19th (image-native scaling, no intermediate layer) and 20th (trimmed bubble layer,
+skipping one scaled redraw per frame while swapping) gains are **all preserved**.
+
+> ⚠️ **LVGL animation state-machine rule:** when several animations write the same
+> property on one object, **each needs its own `exec_cb`**; and `lv_anim_delete()` does
+> not fire `completed_cb`, so any design that "restores state inside `completed_cb`"
+> will **deadlock permanently** if that animation gets deleted. Add a timeout
+> fallback when building this kind of state machine.
+
+| Observation | Result |
+| --- | --- |
+| `idf.py build` | PASS, `Project build complete`, no warnings |
+| `esptool write_flash 0x0` wrote 1,843,680 B (960,758 B compressed), `Hash of data verified.` | PASS, 6.7 s @ 460800 |
+| Boot chain | PASS — reaches the ES8311 codec-ready log and then `main_task: Returned from app_main()`, no watchdog / no panic |
+| Gates: `verify_firmware` / `check_repo` / font coverage (163 chars, 258 glyphs) / archive | all PASS, archived at `build/firmware/afe1b07d…ef8f/` |
+| App size 1,778,144 B | PASS, 79% of the partition free |
+
+## 22nd firmware (release build: diagnostics overlay removed, sha256 `de6b55a4…d9bc`)
+
+The frame-rate investigation is done and the fixes are in place (see the 19th-21st
+builds), so the FPS overlay has served its purpose.
+
+| Change | Note |
+| --- | --- |
+| `CONFIG_LV_USE_SYSMON` off | Commented out. It is the master switch for lv_sysmon; with it off no sysmon timer is registered |
+| `CONFIG_LV_USE_PERF_MONITOR` off | Commented out. It depends on the former; `build/validation-whale/sdkconfig` now reports `is not set` |
+| Everything else unchanged | `LV_DEF_REFR_PERIOD=33` (locked 30 fps) and `LV_USE_CLIB_MALLOC=y` (system heap) stay |
+
+To diagnose again, uncomment the two lines in `sdkconfig.defaults` — both of them,
+since `LV_USE_PERF_MONITOR` depends on `LV_USE_SYSMON` and neither works alone. Also
+remember to delete `build/validation-whale/sdkconfig` afterwards, otherwise the change
+will not take effect.
+
+App size is 1,776,144 B, about 2 KB smaller than the overlay build, still 79% of the
+partition free.
+
+## 23rd firmware (graded failures · differentiated reconnect, sha256 `3832a2a9…fc09`)
+
+Feedback: while DeepSeek was busy, the card kept showing **"Network unavailable"** —
+wrong (the router was fine) and unactionable. Three structural problems stacked up.
+
+**How it went wrong.** The single `WHALE_ST_NETWORK_FAILED` value covered six write
+sites, all rendered as one string. Its `http_status != 200` branch folded **429 rate
+limiting and every 5xx into "network down"** — exactly the path a busy server takes.
+Once written, the status stuck:
+
+- `s_ui.status` was a single slot with no expiry and no failure counter; only the next
+  success could flip it back;
+- the auto-refresh still waited a full `refresh_sec` (60 s by default) — a failure never
+  triggered a faster retry;
+- worst, the poll was gated on `whale_net_state() == WHALE_NET_CONNECTED`, so **once
+  Wi-Fi dropped nothing ever retried**. The line froze on "Network unavailable" until
+  someone pressed a button or power-cycled the card.
+
+| Change | Note |
+| --- | --- |
+| Graded statuses | Split into `NET_UNREACHABLE` (real link failure) / `SERVER_BUSY` (429·5xx) / `DATA_ERROR` (unusable payload), each implying a different action: check the router / wait / compatibility alarm |
+| New `WHALE_ST_STALE` | Mild state for an occasional miss: "Retrying later · 12:34". Not a fault claim, no red flash |
+| Consecutive failures only | `FAIL_REPORT_STREAK = 2` — the second miss escalates; a lone blip stays silent |
+| Balance kept | `has_balance` is untouched on failure; the stale value stays on screen. Old data beats an error string |
+| New `updated_ok` field | Timestamp of the last truly successful fetch (`updated` is the live clock, refreshed every publish). Drives data freshness in the STALE line |
+| Exponential backoff | Retries at 15→30→60→120→300 s instead of hammering a struggling server at the normal interval |
+| **Wi-Fi auto-reconnect** | Poll gate flipped from "must be connected" to "reconnect when not", fixing the freeze above |
+| 401/403 excluded | An invalid key is permanent; backing off is pointless, so it still reports immediately |
+
+```
+              ┌───────────── success → ONLINE (streak=0, record updated_ok)
+              │
+fetch ──fail──→ streak=1 → STALE "Retrying later · 12:34" (old balance still shown)
+              │
+              └── fail again → streak≥2 → NET_UNREACHABLE / SERVER_BUSY / DATA_ERROR
+                                          ↑
+                                    retry after 15→30→60→…→300 s
+```
+
+Seven glyphs added for the new status strings (Chinese characters only, see the
+Chinese doc); the inventory grows 163 → 171 non-ASCII code points, 266 glyphs.
+
+App size 1,780,432 B, 78% of the partition free. `verify_firmware` / `check_repo`
+(375 files) / font coverage all PASS; flashed to COM4 with a clean boot.
+
+## 24th firmware (hint line wording tweak, sha256 `f7e5dd5f…7e16`)
+
+One string changed in the home screen hint line:
+
+```diff
+- Long-press menu . Swipe-up refresh . Swipe-down audition
++ Long-press menu . Swipe-up refresh . Swipe-down head-pat
+```
+
+Character count is unchanged (4 + 3 + 3 in Chinese), so width and centering are
+unaffected and no layout change was needed. Two glyphs added for the new words;
+app size 1,780,848 B (+416 B), still 78% of the partition free.
+
+Flashed to COM4 and confirmed; 101 boot lines, zero errors.
+
+## 25th firmware (the trimmed last character, sha256 `f9888028…f115`)
+
+After flashing the 24th build, **the last character was missing** from the hint line.
+Not a glyph problem (it is in the inventory with sane metrics) — the line simply ran
+**2.25 px over**:
+
+```
+"Long-press menu . Swipe-up refresh . Swipe-down head-pat" -> 206.25 px > CONTENT_W = 204 px
+```
+
+The culprit is the separator: in Noto Sans CJK `·` is a **full-width 16 px** (same as
+a Han character), so with a 3.56 px space on each side every separator costs ~20 px.
+`make_label()` locks height to `LINE_H` (18 px) and leaves LVGL's default **WRAP**
+mode, so the overflow is not clipped horizontally but **wrapped to a second line** —
+which falls outside the 18 px box and vanishes.
+
+> The previous wording ran over by exactly the same amount, so its own tail character
+> was very likely missing too; nobody noticed until the text changed.
+
+Fix: drop the spaces around `·`. Result **192.00 px**, 12 px of slack. A full-width
+`·` already carries its own visual gap, so nothing looks cramped.
+
+**Measure before changing any Chinese string.** Snippet used for the audit below:
+
+```python
+import sys, pathlib; sys.path.insert(0, 'tools')
+import check_whale_font_coverage as C
+src = pathlib.Path('assets/fonts/whale_ui_font_16.c').read_text(encoding='utf-8')
+cmaps, metrics = C.parse_cmaps(src), C.parse_glyph_metrics(src)
+w = lambda s: sum(metrics[cmaps[ord(c)]]['adv_w'] for c in s) / 16   # px
+# Budgets: home/settings hint lines 204 px; status line with badge 204-44-6 = 154 px
+```
+
+Audit results:
+
+| String | Width | Budget | Verdict |
+| --- | --- | --- | --- |
+| `Unconfigured . Hold menu` | 151.12 px | 154 px | OK, only 3 px left |
+| `Hold to return . Hold first item to clear` | 199.12 px | 204 px | OK, only 5 px left |
+| `Connected . 192.168.1.5` | 155.44 px | 154 px | ⚠️ OVER |
+| `Connected . 192.168.100.200` | 190.94 px | 154 px | ⚠️ OVER |
+
+The IP rows are a **pre-existing** issue found along the way: `apply_status_text()`
+falls back to the IP when `updated` is `"--:--"` (SNTP failed), and an IP is far wider
+than a clock time, so its tail wraps away. Left untouched this round (out of scope);
+either special-case that branch or set `LV_LABEL_LONG_DOTS`.
+
+App size 1,780,816 B, still 78% of the partition free. All gates PASS; flashed to COM4
+with a clean 101-line boot.
+
+## 26th firmware (network vs. API failures, sha256 `ddd63e50…0268`)
+
+Feedback: **with a bad API key the card still said "Network unavailable".**
+
+Grading already existed (429/5xx/JSON since the 23rd build) — the **ordering** was
+wrong. One fact was being ignored:
+
+`whale_net_fetch_balance()` **fills `result.http_status` even when it returns an
+error itself.** The old code branched on the transport first:
+
+```c
+if (err != ESP_OK) { -> always NET_UNREACHABLE -> "Network unavailable" }
+```
+
+Which produced this misclassification: the server **did answer** 401 / 429 / 5xx, but
+a truncated streaming response made `esp_http_client_perform()` fail, so the status
+code was discarded and the screen claimed the network was down. Wi-Fi was perfectly
+fine, yet the user got sent to the router — exactly the reported symptom.
+
+**Fix: check whether the server answered before looking at the transport error.**
+
+```
+(1) status in [400,500), != 429 -> AUTH_FAILED      Invalid key, configure   (immediate, not counted)
+(2) status == 429 or >= 500     -> SERVER_BUSY      Server busy, later
+(3) err != OK, Wi-Fi down       -> NET_UNREACHABLE  Network unavailable
+(4) err != OK, Wi-Fi still up   -> API_TIMEOUT      Not synced, retrying      <- new
+(5) status neither 200 nor above -> API_TIMEOUT     Not synced, retrying
+```
+
+The cut between (3) and (4) is the point of this build: **the same "request failed" is
+qualified by whether the link survived.** Only a genuinely broken link earns "Network
+unavailable"; a dead-but-connected request is admitted as "Not synced" instead.
+
+Adds `WHALE_ST_API_TIMEOUT` ("Not synced, retrying", 103.12 px within the 154 px
+budget). Its glyphs were already in the inventory, so **no font rebuild was needed**.
+
+Request-side 4xx also widened from "just 401/403" to **all of 4xx except 429**, so
+400 (bad request) and 402 (out of credit) now route to the re-configure path too —
+they are equally permanent and do not belong under "server busy".
+
+App size 1,780,992 B, still 78% free. `verify_firmware` / `check_repo` (375 files) /
+font coverage (172 characters) all PASS.
+
+**Flashed to COM4**, written in 6.8 s, Hash verified. On device we observed:
+
+```
+W (44029) whale_net: Wi-Fi disconnected, reconnect attempt 1   <- auto-reconnect actually runs
+I (127359) whale_net: Wi-Fi connected, IP=<LAN address>
+I (131485) whale_net: balance request done: HTTP 200, 135 bytes <- balance fetched OK
+```
+
+⚠️ **One `Load access fault` panic appeared on the very first boot after flashing**
+and never reproduced since: 90 s + 150 s of monitoring and three further reset-boots
+were all clean. It should be unrelated to this change — with no credentials stored,
+`whale_config_ready()` returns early and never reaches the HTTP grading added here,
+and the balance fetch later returned 200. Suspected fallout of NVS sitting all-0xFF
+right after a full-chip erase. **If it recurs, capture that serial output** (the panic
+PC/EXCVADDR is what `Addr2Line` needs to point at a source line).
 
 ## Not verified on hardware
 

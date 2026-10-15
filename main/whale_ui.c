@@ -108,19 +108,43 @@ LV_IMAGE_DECLARE(whale_bubble_img);
 // 参考挂件:`.dshwv-body{transform-origin:50% 100%;transition:transform .22s
 // cubic-bezier(.34,1.56,.64,1)}`,按压态 `scaleY(.88) scaleX(1.05)`。
 //
+// ⚠ 缩放**必须用图像自带的 `lv_image_set_scale_x/y`,不能用对象级
+// `lv_obj_set_style_transform_scale_*`** —— 后者只要 scale ≠ 256 就会把对象
+// 标记成 `LV_LAYER_TYPE_TRANSFORM`(见 lv_obj_style.c 的
+// `lv_obj_get_layer_type()`) ,于是 LVGL 每一帧都要:
+//     ① 分配一块 ARGB8888 中间层(139×139 就是 77 KB,而 C3 没有 PSRAM,
+//        只能从内部 RAM 挤);
+//     ② 把角色图正常渲染进这块中间层;
+//     ③ 对中间层做矩阵变换再贴到屏幕;
+//     ④ 释放。
+// 实测这套流程把 Q 弹压到了约 13 fps(0.6 s 只画得出 8 帧),肉眼看就是
+// 「一顿一顿」。换成图像自带变换后走的是 draw unit 的变换 blit,不需要中间层。
+//
 // 舞台里**只有角色**:气泡是另一层,不跟着 Q 弹(实测气泡跟着缩会晃得厉害,
 // 而且舞台一变大,每帧重绘面积翻倍,屏刷新跟不上直接卡成幻灯片)。
-// 现在缩放的只有 240 × 139 的角色区,刷新压力小一半。
+//
+// 舞台宽度**必须等于角色图宽度**:早先写成 240(整屏宽),于是角色左边那
+// 95 px 的空白每帧也要跟着做一次缩放重绘 —— 白烧掉 42% 的填充率。
+// 顺带修正:以前 pivot 落在 x=120(整屏中心),而角色中心其实在 164.5,
+// 缩放时角色会轻微横向漂移;现在 pivot 正好是角色脚底中心。
 #define STAGE_Y0        WHALE_Y              // 舞台上边 = 角色图顶(123)
-#define STAGE_W         240
+#define STAGE_X         WHALE_IMG_X          // 舞台左边 = 角色图左(95)
+#define STAGE_W         WHALE_IMG_S          // 139:只包角色,不包左侧空白
 #define STAGE_H         WHALE_IMG_S          // 139:下边压在角色脚底 262
-#define STAGE_PIVOT_X   (STAGE_W / 2)        // 对应 transform-origin 的 50%
+// 缩放原点(图像局部坐标,相对角色图左上角)= 脚底中心,
+// 对应参考挂件的 transform-origin:50% 100%。
+#define STAGE_PIVOT_X   (STAGE_W / 2)        // 角色脚底中心(屏幕 x ≈ 164.5)
 #define STAGE_PIVOT_Y   STAGE_H              // 对应 100%(屏幕 y = 262)
 
 // 气泡单独一层(图像 + 三行文本),自己有进出场动画,不参与 Q 弹。
-#define BUB_LAYER_X     0
+//
+// ⚠ 层宽**必须只包住气泡图**(194),不能写成整屏 240:气泡图左右各有 16 / 30 px
+// 空白,层一宽,这些空白每帧都要陪着做一次背景重绘 —— 切换气泡时白烧掉 19%
+// 的填充率。位移动画每帧的脏区是「旧位置 ∪ 新位置」,所以宽度直接决定
+// 每帧要处理的像素数。
+#define BUB_LAYER_X     BUB_IMG_X            // 16:与气泡图内容框左对齐
 #define BUB_LAYER_Y     BUB_IMG_Y            // 28:与气泡图内容框对齐
-#define BUB_LAYER_W     240
+#define BUB_LAYER_W     BUB_IMG_W            // 194:只包气泡图,不包两侧空白
 #define BUB_LAYER_H     BUB_IMG_H            // 174 → 28..202,盖住三行文本(最底 132)
 
 // 气泡进出场:一律缓进缓出,方向是「下进下出」——
@@ -189,7 +213,7 @@ typedef struct {
 
 typedef struct {
     page_base_t base;
-    lv_obj_t *stage;       // Q 弹舞台:只有角色图,整块以脚底为原点缩放
+    lv_obj_t *whale_img;   // 角色图本体:Q 弹直接缩放它(不能用对象级 transform)
     lv_obj_t *bubble_layer;// 气泡层(图 + 三行文本),不参与 Q 弹,自己有进出场
     lv_obj_t *bubble;      // 整条气泡图(大椭圆 + 尾巴 + 两个小泡泡)
     lv_obj_t *label;
@@ -227,6 +251,8 @@ static bool s_bub_shown;     // 气泡层目标态:false = 收起(详见下面�
 static int s_rendered_view = -1;         // 气泡里当前画着的是哪个视图(-1 = 还没画过)
 static whale_ui_state_t s_pending;       // 切换动画期间暂存的新内容
 static int s_pending_view;               // 上面那份内容对应的视图
+static bool s_squash_boing_active;       // 一次按键 Q 弹正在进行(期间不让呼吸插进来)
+static bool s_resume_idle_after_in;      // 入场动画结束后是否把常驻呼吸接回去
 
 // ---- 通用小工具 ------------------------------------------------------------
 
@@ -329,23 +355,37 @@ static lv_obj_t *make_screen(void)
 
 static void build_whale(lv_obj_t *parent)
 {
+    // parent 直接就是屏幕,所以用**屏幕绝对坐标**:容器对齐到角色左上角
+    // (95,123)、尺寸 139 × 139,角色图放在容器内 (0,0)。
     lv_obj_t *group = lv_obj_create(parent);
-    lv_obj_set_pos(group, WHALE_X, WHALE_Y - STAGE_Y0);
-    lv_obj_set_size(group, WHALE_W, WHALE_H);
+    lv_obj_set_pos(group, STAGE_X, WHALE_Y);
+    lv_obj_set_size(group, STAGE_W, WHALE_H);
     lv_obj_set_style_bg_opa(group, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(group, 0, 0);
     lv_obj_set_style_pad_all(group, 0, 0);
     lv_obj_clear_flag(group, LV_OBJ_FLAG_SCROLLABLE);
+    // 回弹过冲时角色会画到容器外面一点(scale 到 1.05 约 7 px),不能裁掉。
+    lv_obj_add_flag(group, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     s_home.whale = group;
 
-    // 角色本体:原版 cut-out,透明底,水平居中。
+    // 角色本体:原版 cut-out,透明底,占满整个容器。
+    // Q 弹缩放的是**图像本身**(lv_image_set_scale_*),不是容器 —— 走 draw unit
+    // 的变换 blit,不需要 LVGL 每帧分配 ARGB 中间层(那会让动画掉到 ~13 fps)。
     lv_obj_t *img = lv_image_create(group);
     lv_image_set_src(img, &whale_dsnang_img);
-    lv_obj_set_pos(img, WHALE_IMG_X, 0);
+    lv_obj_set_pos(img, 0, 0);
     lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+    // 缩放原点 = 角色脚底中心(图像局部坐标),等价于参考挂件的
+    // transform-origin:50% 100% —— 压下去时脚不动、头往下沉。
+    lv_image_set_pivot(img, STAGE_PIVOT_X, STAGE_PIVOT_Y);
+    s_home.whale_img = img;
 
     // 金币:平时藏着,检测到消费时才掉下来(落在角色图左侧的空档)。
-    s_home.coin = make_circle(group, COIN_X, 0, 16, C_GOLD);
+    // 挂在**屏幕层**而不是角色容器里,两个原因:
+    //   ① 金币是独立物体,不该跟着角色一起被压扁拉伸;
+    //   ② 右侧靠边的角色容器只有 139 宽,金币留在里面会被边界裁掉。
+    // 因此下面用的是屏幕绝对坐标(与容器无关的 COIN_X / WHALE_Y)。
+    s_home.coin = make_circle(parent, COIN_X, WHALE_Y, 16, C_GOLD);
     lv_obj_add_flag(s_home.coin, LV_OBJ_FLAG_HIDDEN);
     lv_obj_t *coin_mark = make_label(s_home.coin, 0, 1, 16, &whale_ui_font_16, C_PUPIL,
                                      LV_TEXT_ALIGN_CENTER);
@@ -357,25 +397,59 @@ static void build_whale(lv_obj_t *parent)
 
 static void squash_apply(int32_t sy256)
 {
-    if (!s_home.stage) return;
-    lv_obj_set_style_transform_scale_y(s_home.stage, sy256, 0);
-    lv_obj_set_style_transform_scale_x(s_home.stage, SQ_X_OF(sy256), 0);
+    if (!s_home.whale_img) return;
+    // 只缩放图像本身:不需要 ARGB 中间层,比对象级 transform 快一个数量级。
+    lv_image_set_scale_y(s_home.whale_img, (uint32_t)sy256);
+    lv_image_set_scale_x(s_home.whale_img, (uint32_t)SQ_X_OF(sy256));
 }
 
-static void squash_exec_cb(void *obj, int32_t value)
+// ⚠⚠ 常驻呼吸和按键 Q 弹**必须各用一个 exec_cb**,不能共用。
+//
+// `lv_anim_delete(var, exec_cb)` 是按 exec_cb 精确匹配的;而 **lv_anim_delete()
+// 删除动画时不会调用 completed_cb**。v20 里两者共用 squash_exec_cb,于是气泡
+// 切换那句 `lv_anim_delete(whale_img, squash_exec_cb)` 会把按键 Q 弹的回弹段
+// 一起干掉 —— 回弹的 completed_cb 再也不跑,`s_squash_boing_active` 卡在
+// true,常驻呼吸永久停摆 → 卡通小人彻底不动了。
+//
+// 拆成两个 cb 之后,切换气泡只掐呼吸(idle_exec_cb),Q 弹自己跑完回弹再把
+// 呼吸接回去,两者互不干扰。
+static void start_idle_boing(void);                    // 定义在下面,idle_resume 要用
+
+static void idle_exec_cb(void *obj, int32_t value)     // 常驻呼吸
 {
     (void)obj;
     squash_apply(value);
 }
 
+static void boing_exec_cb(void *obj, int32_t value)    // 按键 Q 弹(press / back 两段)
+{
+    (void)obj;
+    squash_apply(value);
+}
+
+// 掐掉常驻呼吸(只掐呼吸,不碰 Q 弹)
+static void idle_stop(void)
+{
+    if (s_home.whale_img) lv_anim_delete(s_home.whale_img, idle_exec_cb);
+}
+
+// 把常驻呼吸接回去;只有当初真的掐过才接,避免重复启动
+static void idle_resume(void)
+{
+    if (s_resume_idle_after_in) {
+        s_resume_idle_after_in = false;
+        start_idle_boing();
+    }
+}
+
 static void start_idle_boing(void)
 {
-    if (!s_home.stage) return;
-    lv_anim_delete(s_home.stage, squash_exec_cb);
+    if (!s_home.whale_img) return;
+    lv_anim_delete(s_home.whale_img, idle_exec_cb);
     lv_anim_t anim;
     lv_anim_init(&anim);
-    lv_anim_set_var(&anim, s_home.stage);
-    lv_anim_set_exec_cb(&anim, squash_exec_cb);
+    lv_anim_set_var(&anim, s_home.whale_img);
+    lv_anim_set_exec_cb(&anim, idle_exec_cb);
     lv_anim_set_values(&anim, SQ_SCALE_1, SQ_IDLE_Y);
     lv_anim_set_duration(&anim, SQ_IDLE_MS);
     lv_anim_set_playback_time(&anim, SQ_IDLE_MS);
@@ -388,6 +462,7 @@ static void start_idle_boing(void)
 static void boing_back_done_cb(lv_anim_t *anim)
 {
     (void)anim;
+    s_squash_boing_active = false;
     start_idle_boing();
 }
 
@@ -396,8 +471,8 @@ static void boing_press_done_cb(lv_anim_t *anim)
     (void)anim;
     lv_anim_t back;
     lv_anim_init(&back);
-    lv_anim_set_var(&back, s_home.stage);
-    lv_anim_set_exec_cb(&back, squash_exec_cb);
+    lv_anim_set_var(&back, s_home.whale_img);
+    lv_anim_set_exec_cb(&back, boing_exec_cb);
     lv_anim_set_values(&back, SQ_PRESS_Y, SQ_SCALE_1);
     lv_anim_set_duration(&back, SQ_BACK_MS);
     // cubic-bezier(.34,1.56,.64,1) —— 参考挂件那条 overshoot 回弹曲线,
@@ -410,14 +485,18 @@ static void boing_press_done_cb(lv_anim_t *anim)
 
 void whale_ui_boing(void)
 {
-    if (!s_ready || !s_home.stage) return;
+    if (!s_ready || !s_home.whale_img) return;
     if (!bsp_lvgl_lock(200)) return;
 
-    lv_anim_delete(s_home.stage, squash_exec_cb);   // 先掐掉常驻呼吸,别抢同一个属性
+    // 连按时先掐掉上一轮没跑完的 Q 弹(它自己的 completed_cb 不会跑,这正是
+    // 我们要的 —— 不让两段 Q 弹叠在一起)。
+    lv_anim_delete(s_home.whale_img, boing_exec_cb);
+    idle_stop();                                         // 呼吸让位,回弹结束会接回
+    s_squash_boing_active = true;                        // 期间气泡切换别把呼吸接回来
     lv_anim_t anim;
     lv_anim_init(&anim);
-    lv_anim_set_var(&anim, s_home.stage);
-    lv_anim_set_exec_cb(&anim, squash_exec_cb);
+    lv_anim_set_var(&anim, s_home.whale_img);
+    lv_anim_set_exec_cb(&anim, boing_exec_cb);
     lv_anim_set_values(&anim, SQ_SCALE_1, SQ_PRESS_Y);
     lv_anim_set_duration(&anim, SQ_PRESS_MS);
     lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
@@ -453,6 +532,13 @@ static void bubble_out_exec_cb(void *obj, int32_t v)
     lv_obj_set_style_opa(layer, (lv_opa_t)(LV_OPA_COVER - (LV_OPA_COVER * v) / 256), 0);
 }
 
+// 入场动画结束后:本轮切换期间角色是静止的,这里把它接回常驻呼吸。
+static void bubble_in_done_cb(lv_anim_t *anim)
+{
+    (void)anim;
+    idle_resume();
+}
+
 // 由下至上:浮上来 + 淡入。
 static void bubble_play_in(void)
 {
@@ -469,6 +555,7 @@ static void bubble_play_in(void)
     lv_anim_set_values(&anim, 0, 256);
     lv_anim_set_duration(&anim, BUB_IN_MS);
     lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);   // 缓进缓出
+    lv_anim_set_completed_cb(&anim, bubble_in_done_cb);
     lv_anim_start(&anim);
 }
 
@@ -478,6 +565,7 @@ static void bubble_out_done_cb(lv_anim_t *anim)
     if (layer == NULL) return;
     // 收起才真的藏起来;切换内容时 s_bub_shown 仍是 true,交给入场动画接管。
     if (!s_bub_shown) lv_obj_add_flag(layer, LV_OBJ_FLAG_HIDDEN);
+    idle_resume();      // 收起是单段,没有入场动画来接,这里自己把呼吸接回去
 }
 
 static void bubble_set_open(bool open)
@@ -488,6 +576,11 @@ static void bubble_set_open(bool open)
     s_bub_shown = open;
     lv_anim_delete(layer, bubble_in_exec_cb);
     lv_anim_delete(layer, bubble_out_exec_cb);
+
+    // 展开/收起这段时间也让角色静止:气泡层与角色区域有 79 px 重叠,
+    // 呼吸会让重叠区每帧多做一次缩放 + alpha 混合。
+    idle_stop();
+    s_resume_idle_after_in = true;
 
     if (open) {
         bubble_play_in();
@@ -516,6 +609,18 @@ static void bubble_swap_content(void)
 
     lv_anim_delete(layer, bubble_in_exec_cb);
     lv_anim_delete(layer, bubble_out_exec_cb);
+    // 切换期间让角色先静止:少一次 139×139 的缩放重绘,把刷新预算全留给气泡。
+    //
+    // 但按键 Q 弹正在跑时**不要插手**:短按 OK 会同时触发 Q 弹和气泡切换,
+    // 而 Q 弹与呼吸用的是不同的 exec_cb,这里 idle_stop() 只掐呼吸,
+    // Q 弹自己跑完回弹会调 start_idle_boing() 把呼吸接回去。
+    // 反过来若这里也掐了 Q 弹,它的 completed_cb 就再也不会跑,呼吸永久停摆。
+    if (!s_squash_boing_active) {
+        idle_stop();
+        s_resume_idle_after_in = true;
+    } else {
+        s_resume_idle_after_in = false;
+    }
 
     lv_anim_t anim;
     lv_anim_init(&anim);
@@ -592,24 +697,13 @@ static void build_home(void)
     lv_obj_t *screen = make_screen();
     build_top_bar(screen, "小鲸鱼记账", &s_home.base);
 
-    // Q 弹舞台:只放角色。气泡单独成层(见下),不跟着弹 —— 气泡跟着缩会晃得厉害,
-    // 而且舞台一变大每帧要重绘整屏,屏刷新跟不上就卡。
-    // 顶栏、状态行、底部提示留在舞台外(它们是屏幕固定元素,不该跟着晃)。
-    lv_obj_t *stage = lv_obj_create(screen);
-    lv_obj_set_pos(stage, 0, STAGE_Y0);
-    lv_obj_set_size(stage, STAGE_W, STAGE_H);
-    lv_obj_set_style_bg_opa(stage, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(stage, 0, 0);
-    lv_obj_set_style_pad_all(stage, 0, 0);
-    lv_obj_set_style_radius(stage, 0, 0);
-    lv_obj_clear_flag(stage, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_transform_pivot_x(stage, STAGE_PIVOT_X, 0);
-    lv_obj_set_style_transform_pivot_y(stage, STAGE_PIVOT_Y, 0);
-    s_home.stage = stage;
-
+    // 以前这里有个 stage 容器,靠 `lv_obj_set_style_transform_scale_*` 整块缩放
+    // 来做 Q 弹。那条路会触发 LVGL 的 ARGB 中间层(每帧分配 77 KB 再变换再释放),
+    // 实测把动画压到 ~13 fps。现在改成**直接缩放角色图本身**,
+    // 容器只是定位用,不再挂任何 transform。顶栏、状态行、底部提示不受影响。
     // 角色先画、气泡压在上面 —— 参考挂件里 img 在 bubble 之前、
     // bubble 带 z-index:1,所以小气泡的黑边是压在角色身上的,这里保持一致。
-    build_whale(stage);
+    build_whale(screen);
 
     // 气泡层:图 + 三行文本。整层一起做进出场(位移 + 淡入淡出),不参与 Q 弹。
     // 建在 stage 之后 → 画在角色上面,和参考的 z 序一致。
@@ -629,20 +723,21 @@ static void build_home(void)
     // 气泡整条一张图:大椭圆 + 半椭圆尾巴 + 两个小泡泡,几何来自参考挂件的 SVG。
     s_home.bubble = lv_image_create(blayer);
     lv_image_set_src(s_home.bubble, &whale_bubble_img);
-    lv_obj_set_pos(s_home.bubble, BUB_IMG_X, BUB_IMG_Y - BUB_LAYER_Y);
+    // 层已经对齐到气泡图内容框左上角,所以气泡图就放在层内 (0,0)。
+    lv_obj_set_pos(s_home.bubble, BUB_IMG_X - BUB_LAYER_X, BUB_IMG_Y - BUB_LAYER_Y);
     lv_obj_clear_flag(s_home.bubble, LV_OBJ_FLAG_CLICKABLE);
 
     // 泡泡内三行文本:标签 / 主数值 / 补充。气泡是张图,文本直接按椭圆中心排版;
     // 主数值与补充行用省略号截断 —— 连接视图要显示 SSID,最长的 32 字节会撑破白底。
     // 三行放进气泡层:收起气泡时它们跟着一起消失(之前挂在舞台上会留下三行孤字)。
-    s_home.label = make_label(blayer, BUB_TEXT_X, BUB_ROW1_Y - BUB_LAYER_Y, BUB_TEXT_W,
+    s_home.label = make_label(blayer, BUB_TEXT_X - BUB_LAYER_X, BUB_ROW1_Y - BUB_LAYER_Y, BUB_TEXT_W,
                               &whale_ui_font_16, C_LABEL, LV_TEXT_ALIGN_CENTER);
     lv_label_set_long_mode(s_home.label, LV_LABEL_LONG_DOT);
-    s_home.amount = make_label(blayer, BUB_TEXT_X, BUB_ROW2_Y - BUB_LAYER_Y, BUB_TEXT_W,
+    s_home.amount = make_label(blayer, BUB_TEXT_X - BUB_LAYER_X, BUB_ROW2_Y - BUB_LAYER_Y, BUB_TEXT_W,
                                &whale_ui_font_24, C_LABEL, LV_TEXT_ALIGN_CENTER);
     lv_obj_set_size(s_home.amount, BUB_TEXT_W, 30);
     lv_label_set_long_mode(s_home.amount, LV_LABEL_LONG_DOT);
-    s_home.hint = make_label(blayer, BUB_TEXT_X, BUB_ROW3_Y - BUB_LAYER_Y, BUB_TEXT_W,
+    s_home.hint = make_label(blayer, BUB_TEXT_X - BUB_LAYER_X, BUB_ROW3_Y - BUB_LAYER_Y, BUB_TEXT_W,
                              &whale_ui_font_16, C_HINT, LV_TEXT_ALIGN_CENTER);
     lv_label_set_long_mode(s_home.hint, LV_LABEL_LONG_DOT);
 
@@ -655,7 +750,9 @@ static void build_home(void)
 
     lv_obj_t *hint = make_label(screen, MARGIN, HINT_Y, CONTENT_W, &whale_ui_font_16,
                                 C_DIM, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(hint, "长按菜单 · 上刷新 · 下试听");
+    // 「·」是全角宽(和汉字一样 16 px),本身自带留白,两侧不能再加空格 ——
+    // 加空格时整行 206 px,超过 CONTENT_W(204 px)会让最后一个字被折到看不见的第二行。
+    lv_label_set_text(hint, "长按菜单·上刷新·下摸头");
 }
 
 // ---- 菜单页 ----------------------------------------------------------------
@@ -825,7 +922,7 @@ void whale_ui_battery_refresh(void)
 }
 
 static void apply_status_text(lv_obj_t *label, whale_status_t status, const char *ip,
-                              const char *updated)
+                              const char *updated, const char *updated_ok)
 {
     char text[64];
     switch (status) {
@@ -850,11 +947,34 @@ static void apply_status_text(lv_obj_t *label, whale_status_t status, const char
     case WHALE_ST_REFRESHING:
         lv_label_set_text(label, "正在取余额…");
         break;
+    case WHALE_ST_STALE:
+        // 偶发失败的温和态:不说"故障",只说"稍后重试",并用陈旧时刻暗示数据有多旧。
+        // 余额照旧显示上一次取到的值 —— 一份旧数据比一句错误有用。
+        if (updated_ok[0] != '\0') {
+            snprintf(text, sizeof(text), "稍后重试 · %s", updated_ok);
+        } else {
+            // 一次都没成功过,没有"上次时刻"可挂,退成不带时间的短句。
+            snprintf(text, sizeof(text), "稍后重试");
+        }
+        lv_label_set_text(label, text);
+        break;
     case WHALE_ST_AUTH_FAILED:
         lv_label_set_text(label, "Key 无效,请配网");
         break;
-    case WHALE_ST_NETWORK_FAILED:
+    case WHALE_ST_NET_UNREACHABLE:
         lv_label_set_text(label, "网络不可用 · 重试");
+        break;
+    case WHALE_ST_API_TIMEOUT:
+        // Wi-Fi 是通的,只对方迟迟不回应:这时候说"网络不可用"是冤枉本地网络,
+        // 用户会跑去重启路由器,而实际上什么都查不出来 —— 只报"没同步上"。
+        lv_label_set_text(label, "未同步 · 重试");
+        break;
+    case WHALE_ST_SERVER_BUSY:
+        // 对方 429 限流或 5xx:这一侧什么都做不了,明确让用户知道不必折腾本地网络。
+        lv_label_set_text(label, "服务器繁忙 · 稍后");
+        break;
+    case WHALE_ST_DATA_ERROR:
+        lv_label_set_text(label, "数据异常 · 重试");
         break;
     case WHALE_ST_NO_TIME:
         lv_label_set_text(label, "时间未同步");
@@ -1019,7 +1139,8 @@ void whale_ui_update(const whale_ui_state_t *state)
         render_bubble_content(state, view);
     }
 
-    apply_status_text(s_home.status, state->status, state->ip, state->updated);
+    apply_status_text(s_home.status, state->status, state->ip, state->updated,
+                      state->updated_ok);
     update_battery_widget(&s_home.base, state->battery);
 
     bsp_lvgl_unlock();
@@ -1166,14 +1287,15 @@ void whale_ui_coin_drop(void)
 
     lv_anim_delete(s_home.coin, NULL);
     lv_obj_remove_flag(s_home.coin, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_y(s_home.coin, 0);
+    // 金币现在挂在屏幕层,这里用的是屏幕绝对 y(从角色头顶落到胸口)。
+    lv_obj_set_y(s_home.coin, WHALE_Y);
     lv_obj_set_style_bg_opa(s_home.coin, LV_OPA_COVER, 0);
 
     lv_anim_t anim;
     lv_anim_init(&anim);
     lv_anim_set_var(&anim, s_home.coin);
     lv_anim_set_exec_cb(&anim, coin_y_cb);
-    lv_anim_set_values(&anim, 0, 72);
+    lv_anim_set_values(&anim, WHALE_Y, WHALE_Y + 72);
     lv_anim_set_duration(&anim, 520);
     lv_anim_set_path_cb(&anim, lv_anim_path_bounce);
     lv_anim_set_completed_cb(&anim, coin_done_cb);

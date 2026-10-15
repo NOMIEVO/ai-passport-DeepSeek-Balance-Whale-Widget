@@ -22,13 +22,21 @@ typedef enum {
 } whale_page_t;
 
 // 挂件页底部状态行。UI 负责把它翻成中文。
+//
+// 失败是分级的:偶发一次只走到 WHALE_ST_STALE(温和提示,余额仍是上一次的值),
+// 连续失败才会升级到下面三个「严重」态,各自对应不同的故障来源 —— 用户看完这句话
+// 就知道该去查路由器,还是只能等对方的服务恢复。
 typedef enum {
     WHALE_ST_UNCONFIGURED = 0,   // 还没配网
     WHALE_ST_CONNECTING,         // 正在连 Wi-Fi
-    WHALE_ST_ONLINE,             // 已连接
+    WHALE_ST_ONLINE,             // 已连接(数据是新鲜的)
     WHALE_ST_REFRESHING,         // 正在取余额
-    WHALE_ST_AUTH_FAILED,        // API Key 无效(401/403)
-    WHALE_ST_NETWORK_FAILED,     // 网络不通 / 超时
+    WHALE_ST_STALE,              // 上一次取数失败,正在退避重试;余额是旧的
+    WHALE_ST_AUTH_FAILED,        // API Key 无效(401/403)等请求侧 4xx
+    WHALE_ST_NET_UNREACHABLE,    // 真的网络不通:Wi-Fi 掉线 / DNS / TLS / 连接失败
+    WHALE_ST_API_TIMEOUT,        // Wi-Fi 还在、对方却没回应完:API 超时 / 中途断流
+    WHALE_ST_SERVER_BUSY,        // 服务器侧:429 限流、5xx 网关错误
+    WHALE_ST_DATA_ERROR,         // 拿到了响应但内容不对(JSON 缺字段 / 被截断)
     WHALE_ST_NO_TIME,            // 时间没同步出来(峰谷降级)
     WHALE_ST_BUDGET_HIT,         // 今日已用触达预算
     WHALE_ST_BALANCE_LOW,        // 余额低于预警阈值
@@ -78,7 +86,8 @@ typedef struct {
     char ssid_preview[34];       // ASCII 预览
     char key_hint[24];           // ASCII,形如 "…1a2b" 或 "none"
     char ip[18];                 // ASCII,形如 "192.168.1.5"
-    char updated[12];            // ASCII,形如 "12:34" 或 "--:--"
+    char updated[12];            // ASCII,形如 "12:34" 或 "--:--"(当前时钟时刻)
+    char updated_ok[12];         // ASCII:最后一次「取到余额」的时刻,空串 = 一次都没成过
     uint32_t refresh_sec;        // 自动刷新间隔(秒)
     bool bubble_open;            // false = 泡泡收起,只留小鲸鱼
 } whale_ui_state_t;

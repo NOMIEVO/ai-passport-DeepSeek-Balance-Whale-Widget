@@ -27,8 +27,8 @@
 | 泡泡 | 白底蓝边**真椭圆**(194 × 120)+ 半椭圆尾巴 + 两颗小椭圆泡泡,整条一张图;内部三行居中文本 |
 | 角色图 | 参考挂件原版 `DSniang1.png`(139 × 139,RGB565A8),纵向占 123..262、**靠右**(横向 95..234,右边距 6 px),常驻 Q 弹呼吸 |
 | 余额动画 | 余额变化时主数值**滚动**到新值(600 ms 数值补间),见下方「余额滚动动画」 |
-| 状态行 | 左峰/谷徽章 + 未配网 / 连接中 / 已连接 / 取余额中 / Key 无效 / 网络不可用 / 超预算 / 余额低 |
-| 提示行 | `长按菜单 · 上刷新 · 下试听` |
+| 状态行 | 左峰/谷徽章 + 未配网 / 连接中 / 已连接 / 取余额中 / 稍后重试 / Key 无效 / 网络不可用 / 服务器繁忙 / 数据异常 / 超预算 / 余额低(后三者与"稍后重试"见「失败分级」) |
+| 提示行 | `长按菜单·上刷新·下摸头`(**「·」两侧不留空格**,见下方第 25 版) |
 
 泡泡序列(对应挂件"点按角色推进队列,走到最后一项再点收起"):
 **余额 → 今日已用 → 峰谷时段 → 连接 → 收起**(收起后只留小鲸鱼,再按一次从余额重新开始)。
@@ -342,7 +342,7 @@ RMS 包络与零穿越率轨迹,再落到音符表里。挂件是取样音色,�
 
 ### 第 1 版固件(HTTPD 512 B,sha256 `2d027147…311c0d`)
 
-- 目标:COM3,ESP32-C3(QFN32)rev v1.1,内嵌 8 MB Flash,MAC `4c:11:ae:2f:e1:68`
+- 目标:COM3,ESP32-C3(QFN32)rev v1.1,内嵌 8 MB Flash(设备序列号略)
 - 刷写:`esptool write_flash 0x0 FoloToy-AI-Passport-full.bin` → 写入 1,655,504 B,
   `Hash of data verified.`,Hard reset 后自行启动
 - 开机日志(复位后 15 s 窗口,`E:/Workbuddy/MPD/esp/whale_boot.log`,原始日志留在仓库外):
@@ -479,6 +479,316 @@ Q 弹登场版:角色、气泡图、泡泡内三行文本全放进 `stage`(y 28.
 | app 体积 1,776,032 B | PASS,分区余 79% |
 | 门禁:`check_repo` / 字体覆盖(163 字)/ `verify_firmware` / 归档 | 全部 PASS,归档 `build/firmware/0b33e85b…7044/` |
 | 刷写后回到未配网状态 | 预期内:0x0 整片刷写覆盖 `nvs`(0x9000)与 `phy_init`(0xf000),需重新配网 |
+
+### 第 18 版固件(性能:舞台瘦身 + 锁 30 fps + FPS 浮层,sha256 `763231d4…8831cb`)
+
+针对「动画卡顿」的第一次优化。诊断结论**:不是帧率配错,而是单帧干不完 20 ms 的活**。
+
+| 改动 | 说明 |
+| --- | --- |
+| 舞台瘦身 | `stage` 从 `240 × 139` 改成 `139 × 139` 并对齐角色左上角(x=95);每帧重绘 33,360 → **19,321 px,砍掉 42%**(左边 95 px 空白以前每帧都要陪着缩放) |
+| pivot 修正 | 原来落在 x=120(整屏中心),而角色中心在 164.5,缩放时角色一直轻微横移;现在正好是脚底中心 |
+| 刷新周期 | `LV_DEF_REFR_PERIOD` 20 → **33 ms**。与其追 50 fps 跑不稳,不如锁 30 fps 让帧间隔稳定 —— 稳定 = 匀速 = 不顿挫 |
+| 诊断开关 | 开 `LV_USE_SYSMON` + `LV_USE_PERF_MONITOR`,屏幕右下角实时显示 FPS / CPU%(注意:后者依赖前者) |
+
+刷入后实测:**按一次按钮仍然只有约 8 帧(≈13 fps)** —— 说明瓶颈不在重绘面积,而是下面第 19 版找到的**对象级 transform 中间层**。
+
+### 第 19 版固件(根治:改用图像自带缩放,sha256 `90381305…9bb1c`)
+
+沿第 18 版的 FPS 浮层继续查,在 LVGL 源码 `lv_obj_style.c` 的
+`lv_obj_get_layer_type()` 里找到了真凶:
+
+```c
+if(lv_obj_get_style_transform_scale_x(obj, LV_PART_MAIN) != 256) return LV_LAYER_TYPE_TRANSFORM;
+if(lv_obj_get_style_transform_scale_y(obj, LV_PART_MAIN) != 256) return LV_LAYER_TYPE_TRANSFORM;
+```
+
+**只要给对象挂 `transform_scale_*` 且值 ≠ 256,LVGL 就把它标成 `LV_LAYER_TYPE_TRANSFORM`,
+于是每一帧都要:① 分配一块 ARGB8888 中间层(139×139 = 77 KB,而 C3 无 PSRAM,只能挤内部 RAM);
+② 把角色图正常渲染进中间层;③ 对中间层做矩阵变换贴到屏幕;④ 释放。**
+每帧一次,这就是 0.6 s 只画得出 8 帧的原因。
+
+| 改动 | 说明 |
+| --- | --- |
+| 缩放对象换掉 | `lv_obj_set_style_transform_scale_*(stage)` → **`lv_image_set_scale_x/y(whale_img)`**。图像自带变换走 draw unit 的变换 blit,**不需要中间层** |
+| 删掉 stage 容器 | 角色容器直接挂屏幕,只用屏幕绝对坐标定位,不再挂任何 transform |
+| 过冲不被裁 | 容器加 `LV_OBJ_FLAG_OVERFLOW_VISIBLE` —— 回弹过冲到 1.05 时会画到容器外约 7 px |
+| 缩放原点 | 用 `lv_image_set_pivot(img, 69, 139)` = 角色脚底中心,等价于参考挂件的 `transform-origin:50% 100%` |
+
+手感参数保持不变(压 180 ms / 回弹 420 ms / 呼吸半周期 2.4 s)。
+
+| 观察项 | 结果 |
+| --- | --- |
+| `idf.py build` | PASS,`Project build complete`,无警告 |
+| `esptool write_flash 0x0` 写入 1,843,504 B(压缩 960,672 B),`Hash of data verified.` | PASS,6.7 s @ 460800 |
+| 25 s 串口窗口无看门狗 / 无 panic | PASS |
+| 门禁:`verify_firmware` / `check_repo`(375 文件)/ 字体覆盖(163 字)/ 归档 | 全部 PASS,归档 `build/firmware/90381305…9bb1c/` |
+| app 体积 1,777,968 B | PASS,分区余 79% |
+
+⚠️ 本版仍带右下角 FPS 浮层(诊断用),正式发布前需注释掉
+`CONFIG_LV_USE_SYSMON` 与 `CONFIG_LV_USE_PERF_MONITOR` 再出一版。
+
+### 第 20 版固件(切换气泡时的掉帧优化,sha256 `5127a6c4…fde0`)
+
+第 19 版后用户实测:**静态时帧率明显上升,但切换气泡时仍掉到 15 帧左右**。
+
+算了一下切换时的每帧重绘量,和掉帧幅度是对得上的:
+
+| 场景 | 每帧要处理的像素 | 实测 |
+| --- | --- | --- |
+| 静态(只有常驻呼吸) | 角色 139×139 ≈ **19,321** | ~30 fps ✅ |
+| 切换气泡 | 气泡层 **240×177 ≈ 42,480** + 角色 19,321 ≈ **61,800** | ~15 fps ❌ |
+
+位移动画每帧的脏区是「旧位置 ∪ 新位置」,所以**层宽直接决定每帧像素数**。
+而气泡层写的是整屏宽 240,气泡图其实只有 194 宽 —— 左右各有 16 / 30 px 的空白
+每帧都要陪着做一次背景重绘。更要紧的是气泡层 (y 28..202) 和角色 (y 123..262)
+**重叠了 79 px**,于是每次重绘气泡层都要顺带把重叠区的角色**重新做一遍缩放 +
+alpha 混合**。
+
+| 改动 | 说明 |
+| --- | --- |
+| 气泡层瘦身 | `BUB_LAYER_X` 0 → `BUB_IMG_X`(16)、`BUB_LAYER_W` 240 → `BUB_IMG_W`(194);只包气泡图,不包两侧空白(-19%) |
+| 子对象坐标跟着调整 | 气泡图落在层内 (0,0);三行文本 x 改成 `BUB_TEXT_X - BUB_LAYER_X`,屏幕位置不变 |
+| 切换期间角色静止 | `bubble_swap_content()` 里先 `lv_anim_delete(whale_img, squash_exec_cb)` 掐掉常驻呼吸 —— 省掉每帧一次 139×139 的缩放重绘(-31%);入场动画结束后由 `bubble_in_done_cb` 接回去 |
+| 冲突保护 | 新增 `s_squash_boing_active`:按键 Q 弹还在跑时,气泡入场结束**不**恢复呼吸,免得两个动画抢同一个属性;Q 弹自己的回弹回调负责接回 |
+
+合计每帧像素量 61,800 → 约 34,300(**-44%**),预计能回到 25 fps 上下。
+
+| 观察项 | 结果 |
+| --- | --- |
+| `idf.py build` | PASS,`Project build complete`,无警告 |
+| `esptool write_flash 0x0` 写入 1,843,600 B(压缩 960,781 B),`Hash of data verified.` | PASS,6.7 s @ 460800 |
+| 22 s 串口窗口无看门狗 / 无 panic | PASS |
+| 门禁:`verify_firmware` / `check_repo`(375 文件)/ 字体覆盖(163 字)/ 归档 | 全部 PASS,归档 `build/firmware/5127a6c4…fde0/` |
+| app 体积 1,778,064 B | PASS,分区余 79% |
+
+⚠️ 本版仍带 FPS 浮层。等切换动画的实测帧率确认后,再关掉两个 SYSMON 开关出正式版。
+
+### 第 21 版固件(修复「卡通小人不动」回归,sha256 `afe1b07d…ef8f`)
+
+第 20 版刷入后用户反馈:**卡通小人完全不动了** —— 常驻呼吸没了,按键 Q 弹也看不到。
+
+**根因是两个动画共用了同一个 exec_cb,被无差别删除:**
+
+- `lv_anim_delete(var, exec_cb)` 是按 exec_cb **精确匹配**删除的;
+- 而 **`lv_anim_delete()` 删除动画时不会调用 `completed_cb`**。
+
+第 20 版里「常驻呼吸」和「按键 Q 弹」共用 `squash_exec_cb`,而短按确定的调用链是:
+
+```text
+handle_input
+  ├─ press_cue()      → whale_ui_boing()   启动 press 段(180ms),标记 active = true
+  └─ bubble_advance() → publish_ui()
+       └─ whale_ui_update() 发现 view 变了
+            └─ bubble_swap_content()
+                 └─ lv_anim_delete(whale_img, squash_exec_cb)   // 💥 把刚启动的 press 一起删了
+```
+
+press 段被删 → 它的完成回调不跑 → **back(回弹)段永远不启动** → 回弹的完成回调也不跑 →
+`s_squash_boing_active` 永久卡在 `true` → 常驻呼吸再也不恢复 → 角色彻底静止。
+
+| 改动 | 说明 |
+| --- | --- |
+| 拆成两个回调 | `idle_exec_cb`(常驻呼吸)/ `boing_exec_cb`(按键 Q 弹的 press + back 两段),两者都调 `squash_apply()` |
+| 新增 `idle_stop()` | **只掐呼吸,绝不碰 Q 弹** —— 这是修复的关键 |
+| 新增 `idle_resume()` | 配对设计:只有当初真的掐过才恢复,避免共享布尔量被后发起的动画覆盖 |
+| 切换气泡改成条件暂停 | Q 弹在跑时**完全不插手**(不设恢复标志),让 Q 弹自己跑完回弹再接回呼吸;Q 弹没在跑时才暂停并标记恢复 |
+| 收起气泡补恢复 | `bubble_out_done_cb` 里加 `idle_resume()` —— 收起是单段动画,没有入场段来接 |
+| `bubble_play_in()` 去参数 | 恢复标志改由调用方设置,避免共享状态被后发起的动画覆盖 |
+
+第 19 版(图像自带缩放、无中间层)与第 20 版(气泡层瘦身、切换期间省一次缩放重绘)
+的收益**全部保留**。
+
+> ⚠️ **LVGL 动画状态机铁律**:同一对象上跑多个写同一属性的动画时,**每个动画必须用
+> 独立的 `exec_cb`**;且 `lv_anim_delete()` 不触发 `completed_cb`,所以任何
+> 「在 `completed_cb` 里恢复状态」的设计,一旦动画被误删就会**永久卡死**。
+> 设计这类状态机时最好再加超时兜底。
+
+| 观察项 | 结果 |
+| --- | --- |
+| `idf.py build` | PASS,`Project build complete`,无警告 |
+| `esptool write_flash 0x0` 写入 1,843,680 B(压缩 960,758 B),`Hash of data verified.` | PASS,6.7 s @ 460800 |
+| 启动链路 | PASS —— 走到 `bsp_audio: ES8311 就绪` → `main_task: Returned from app_main()`,无看门狗 / 无 panic |
+| 门禁:`verify_firmware` / `check_repo` / 字体覆盖(163 字,258 glyph)/ 归档 | 全部 PASS,归档 `build/firmware/afe1b07d…ef8f/` |
+| app 体积 1,778,144 B | PASS,分区余 79% |
+
+### 第 22 版固件(正式版:关掉诊断浮层,sha256 `de6b55a4…d9bc`)
+
+性能到底的方法已经查清并修好(见第 19~21 版),诊断用的 FPS 浮层可以退场了。
+
+| 改动 | 说明 |
+| --- | --- |
+| 关掉 `CONFIG_LV_USE_SYSMON` | 注释掉。它是 lv_sysmon 的总开关,关掉后不再注册 sysmon 定时器 |
+| 关掉 `CONFIG_LV_USE_PERF_MONITOR` | 注释掉。它依赖前者,`build/validation-whale/sdkconfig` 里确认已是 `is not set` |
+| 其余配置不变 | `LV_DEF_REFR_PERIOD=33`(锁 30 fps)、`LV_USE_CLIB_MALLOC=y`(系统堆)都保留 |
+
+需要再诊断时把 `sdkconfig.defaults` 里那两行注释解开即可 —— 记得**同时**解开,
+`LV_USE_PERF_MONITOR` 依赖 `LV_USE_SYSMON`,只开一个不生效;
+并且改完要删掉 `build/validation-whale/sdkconfig` 才会重新生效。
+
+app 体积 1,776,144 B,比带浮层的版本小约 2 KB,分区仍余 79%。
+
+### 第 23 版固件(失败分级 · 差异化重连,sha256 `3832a2a9…fc09`)
+
+反馈:DeepSeek 服务繁忙时,屏幕一直显示**「网络不可用」** —— 既与事实不符(路由
+是好的),也没告诉用户该怎么办。查下来是三个结构性问题叠在一起。
+
+**原来怎么写错的**:`WHALE_ST_NETWORK_FAILED` 一个枚举兜了 6 个写入点,连文案都
+是同一句。其中 `http_status != 200` 这一支把 **429 限流与 5xx 全部算成"网络不通"**
+—— 服务端繁忙走的就是这条。而失败一经写入就被钉住:
+
+- `s_ui.status` 是单值槽,没有过期时间也没有失败计数,只有下一次成功才能翻回去;
+- 自动刷新想重来还得等满一个 `refresh_sec`(默认 60 s),失败**不会**触发更快重试;
+- 更要紧的是轮询条件写的是 `whale_net_state() == WHALE_NET_CONNECTED` ——
+  **Wi-Fi 一掉线,连重试都不跑了**,状态行直接钉死成"网络不可用",只剩按键或重启。
+
+| 改动 | 说明 |
+| --- | --- |
+| 状态分级 | 拆成 `NET_UNREACHABLE`(真网络故障)/ `SERVER_BUSY`(429·5xx)/ `DATA_ERROR`(返回体异常),各自对应不同处置:查路由 / 等对方恢复 / 兼容性告警 |
+| 新增 `WHALE_ST_STALE` | 偶发失败的温和态,文案「稍后重试 · 12:34」;不说"故障",也不让屏幕跳红字 |
+| 连续失败才升级 | `FAIL_REPORT_STREAK = 2`:第 2 次失败才升级到严重态,单次抖动全程静默 |
+| 余额降级保留 | 失败时 `has_balance` 不清,旧余额照显 —— 一份旧数据比一句错误有用 |
+| 新增 `updated_ok` 字段 | 记最后一次「真正取到余额」的时刻(`updated` 是当前时钟,每次 publish 都在刷),供 STALE 态显示数据新鲜度 |
+| 指数退避 | 失败后按 15→30→60→120→300 s 递增重试,不再按原刷新间隔猛撞已繁忙的服务端 |
+| **Wi-Fi 断线自动重连** | 轮询条件从"必须已连接"改成"未连接就 `connect_and_refresh()`",修掉上面的钉死问题 |
+| 401/403 不参与计数 | Key 无效是永久错误,退避重试没意义,照旧立即明说 |
+
+状态机的完整形态:
+
+```
+                ┌───────────── 成功 → ONLINE(streak=0, 记 updated_ok)
+                │
+取数 ──失败──→ streak=1 → STALE「稍后重试 · 12:34」(余额仍显示旧值)
+                │
+                └── 再失败 → streak≥2 → NET_UNREACHABLE / SERVER_BUSY / DATA_ERROR
+                                         ↑
+                                    退避 15→30→60→…→300 s 后重试
+```
+
+新增字模：稍/服/务/繁/忙/异/常 + 摸/头(第 24 版),字表 163 → 172 个非 ASCII 码位,267 glyph。
+
+app 体积 1,780,432 B,分区余 78%;门禁 `verify_firmware` / `check_repo`(375 文件)/
+字体覆盖 全 PASS,已刷入 COM4 并确认启动无 panic。
+
+### 第 24 版固件(提示行文案微调,sha256 `f7e5dd5f…7e16`)
+
+只动了挂件页底部提示行的一句文案:
+
+```diff
+- 长按菜单 · 上刷新 · 下试听
++ 长按菜单 · 上刷新 · 下摸头
+```
+
+字数结构不变(4 + 3 + 3),行宽与居中方式都不受影响,不需要改布局。只多了「摸」「头」
+两个字模,app 体积 1,780,848 B(+416 B),分区仍余 78%。
+
+已刷入 COM4 确认;启动 101 行 BAD=0。
+
+### 第 25 版固件(补上被挤掉的最后一个字,sha256 `f9888028…f115`)
+
+第 24 版刷入后反馈:**「摸头」的「头」没显示出来**。不是字模缺失(字表里「摸」「头」
+都在,glyph metrics 也正常),是**行宽溢出了 2.25 px**。
+
+```
+"长按菜单 · 上刷新 · 下摸头" 实测 206.25 px  >  CONTENT_W = 204 px
+```
+
+罪魁是那个中点:`·` 在 Noto Sans CJK 里是**全角宽 16 px**(和汉字一样),两侧再各
+加一个 3.56 px 空格,等于每处分隔符要吃掉 20 px。而 `make_label()` 的高度锁死
+`LINE_H`(18 px)、long_mode 用 LVGL 默认的 **WRAP** —— 溢出的部分不会横向裁掉,
+而是**折到第二行**,第二行又在 18 px 的框外面,于是最后一个字凭空消失。
+
+> 顺带说明:24 版之前那句「下试听」同样溢出(= 同样 206.25 px),所以更早之前的
+> 「听」大概率也没显示 —— 这次改完文案才被注意到。
+
+修法是去掉 `·` 两侧的空格:**192.00 px**,余量 12 px。`·` 本身全角已自带留白,
+不加空格视觉间隔照样成立。
+
+```diff
+- lv_label_set_text(hint, "长按菜单 · 上刷新 · 下摸头");
++ lv_label_set_text(hint, "长按菜单·上刷新·下摸头");
+```
+
+**以后改中英文案前先量一下宽度**,别等到刷完机才发现末尾少字:
+
+```python
+import sys, pathlib; sys.path.insert(0, 'tools')
+import check_whale_font_coverage as C
+src = pathlib.Path('assets/fonts/whale_ui_font_16.c').read_text(encoding='utf-8')
+cmaps, metrics = C.parse_cmaps(src), C.parse_glyph_metrics(src)
+w = lambda s: sum(metrics[cmaps[ord(c)]]['adv_w'] for c in s) / 16   # 返回 px
+# 对照:挂件页提示行/设置页提示行 204 px;状态行带徽章时 204-44-6 = 154 px
+```
+
+用这条公式顺手把全量文案扫了一遍,结果:
+
+| 文案 | 宽度 | 上限 | 结论 |
+| --- | --- | --- | --- |
+| `未配网 · 长按开菜单` | 151.12 px | 154 px | OK(余 3 px,别再加字) |
+| `长按返回 · 长按首项清凭据` | 199.12 px | 204 px | OK(余 5 px,别再加字) |
+| `已连接 · 192.168.1.5` | 155.44 px | 154 px | ⚠️ **OVER** |
+| `已连接 · 192.168.100.200` | 190.94 px | 154 px | ⚠️ **OVER** |
+
+最后一行是这次顺手挖出的**既有隐患**:`apply_status_text()` 在 `updated` 为
+`"--:--"`(SNTP 没授时成功)时会改挂 IP,而 IP 通常比时刻长得多 → 尾部被折掉。
+本版**未改**(超出这次的范围),要修的话一是把状态行的 IP 分支单独换短文案,
+二是给它设 `LV_LABEL_LONG_DOTS`。
+
+app 体积 1,780,816 B,分区仍余 78%;门禁全 PASS,已刷入 COM4,启动 101 行 BAD=0。
+
+### 第 26 版固件(区分"网络问题"与"API 问题",sha256 `ddd63e50…0268`)
+
+反馈:**API 不对的时候,下面显示的还是"网络不可用"**。
+
+查下来不是分级没做(第 23 版已经分了 429/5xx/JSON),而是**判定顺序错了**。
+
+`whale_net_fetch_balance()` **即使自己返回了错误码,也已经把服务端给的 HTTP 状态码
+填进了 `result.http_status`**。而旧代码第一条分支就是
+
+```c
+if (err != ESP_OK) { → 一律 NET_UNREACHABLE → "网络不可用" }
+```
+
+于是出现这种错案:**服务端明明回了 401 / 429 / 5xx**,只是流式响应中途断流导致
+`esp_http_client_perform()` 报错 → 状态码被完全无视 → 屏幕谎称"网络不可用"。
+用户的 Wi-Fi 好好的,却被指引去查路由器 —— 正是这次反馈的来源。
+
+**修法:把「服务端有没有回话」提到最前面。**
+
+```
+① status ∈ [400,500) 且 ≠ 429  → AUTH_FAILED     Key 无效,请配网   (立即,不计数)
+② status = 429 或 ≥ 500        → SERVER_BUSY     服务器繁忙 · 稍后
+③ err ≠ OK 且 Wi-Fi 已掉线     → NET_UNREACHABLE 网络不可用 · 重试
+④ err ≠ OK 但 Wi-Fi 还在       → API_TIMEOUT     未同步 · 重试     ← 新增
+⑤ status 既非 200 也非上面几类 → API_TIMEOUT     未同步 · 重试
+```
+
+③④这一刀是这次的关键:**同一个"请求没成",用 Wi-Fi 是否还在来定性** ——
+链路真断了才说"网络不可用";链路通的、只是对方没答完,只报"未同步",不冤枉本地网络。
+
+新增 `WHALE_ST_API_TIMEOUT`(文案「未同步 · 重试」,103.12 px / 154 px 预算内,够宽)。
+「未/同/步」三个字本来就在字表里,**无需重铸字模**。
+
+另外把请求侧 4xx 从"仅 401/403"放宽到 **4xx 整体(429 除外)**,让 400(参数)、
+402(账户没钱)也走"Key 无效,请配网"这条指回配网页的路径 —— 它们同样是"怎么重试都没用"
+的永久错误,不该混进"服务器繁忙"。
+
+app 体积 1,780,992 B,分区仍余 78%;门禁 `verify_firmware` / `check_repo`(375 文件)/
+字体覆盖(172 字)全 PASS。
+
+**已刷入 COM4**,写入 6.8 s,Hash verified。真机观察到:
+
+```
+W (44029) whale_net: Wi-Fi 断开,第 1 次重连      ← 自动重连确实在跑(第 23 版加的)
+I (127359) whale_net: 已连接 Wi-Fi,IP=<本机内网地址>
+I (131485) whale_net: 余额请求完成: HTTP 200, 135 字节   ← 取余额成功
+```
+
+⚠️ **刷后第一次上电的串口里出现过一次 `Load access fault` panic**,之后再没复现:
+连续监听 90 s + 150 s、外加 3 次复位启动均干净(BAD=0)。从代码路径看它与本版改动
+无关 —— 未配网时 `whale_config_ready()` 会提前返回,根本走不到这次改的 HTTP 分层,
+且事后余额请求正常返回 200。推测是整片擦写后 NVS 处于全 0xFF 状态时的偶发。
+**若再次出现,请把那一段串口输出留给我**(用 `Addr2Line` 定位需要 panic 时的 PC/EXCVADDR)。
 
 ## 未验证项
 

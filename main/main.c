@@ -55,6 +55,14 @@ static const char *TAG = "whale";
 #define CONNECT_TIMEOUT_MS  20000
 #define TIME_SYNC_TIMEOUT_MS 8000
 
+// 取数失败要连着失败这么多次,状态行才升级成「网络不可用 / 服务器繁忙」那一类严重态。
+// 少于这个数一律停在 WHALE_ST_STALE("稍后重试")—— 偶发一次抖动不该让屏幕跳红字。
+#define FAIL_REPORT_STREAK  2
+
+// 失败后的退避重试间隔(秒),依次取用,到最后一项就停在那儿。
+// 服务器繁忙时若仍按正常刷新间隔猛撞,只会让自己更难排上队。
+static const uint32_t BACKOFF_STEPS_SEC[] = { 15, 30, 60, 120, 300 };
+
 typedef enum {
     CMD_CONNECT = 0,      // 用当前配置连 Wi-Fi(成功后授时 + 取一次余额)
     CMD_REFRESH,          // 直接取一次余额(已连接时)
@@ -88,6 +96,7 @@ static bool s_dimmed;
 static bool s_bubble_open = true;   // 泡泡是否展开(收起时只留小鲸鱼)
 static bool s_budget_hit;           // 今日已用已触达预算(只提示一次)
 static bool s_warn_hit;             // 余额已低于预警线(只提示一次)
+static uint8_t s_fail_streak;       // 连续取数失败次数(成功即清零)
 
 // 音效总开关的唯一闸口:所有发声都过这里,关掉后一律静音。
 static void play_sound(whale_sound_t sound)
@@ -212,6 +221,34 @@ static void check_thresholds(void)
     }
 }
 
+// 失败登记:连续失败次数决定状态行怎么说。
+//
+// 前 FAIL_REPORT_STREAK-1 次只走到 WHALE_ST_STALE("稍后重试 · 上次成功时刻"),
+// 余额继续显示上一次取到的值;到了阈值才升到 severe 那一档严重态。
+// 返回 true 表示这次真的报错了(调用方据此决定要不要响错误音)。
+static bool note_failure(whale_status_t severe)
+{
+    if (s_fail_streak < 255) s_fail_streak++;
+
+    if (s_fail_streak >= FAIL_REPORT_STREAK) {
+        s_ui.status = severe;
+        ESP_LOGW(TAG, "取数连续失败 %u 次 → 状态升级", (unsigned)s_fail_streak);
+        return true;
+    }
+    s_ui.status = WHALE_ST_STALE;
+    return false;
+}
+
+// 按连续失败次数算下一次重试该等多久:失败越多间隔越长,但不超过最后一档。
+static int64_t backoff_us(void)
+{
+    if (s_fail_streak == 0) return 0;
+    const size_t idx = (s_fail_streak - 1) < (sizeof(BACKOFF_STEPS_SEC) / sizeof(BACKOFF_STEPS_SEC[0]))
+                           ? (s_fail_streak - 1)
+                           : (sizeof(BACKOFF_STEPS_SEC) / sizeof(BACKOFF_STEPS_SEC[0]) - 1);
+    return (int64_t)BACKOFF_STEPS_SEC[idx] * 1000 * 1000;
+}
+
 static bool fetch_balance_once(bool manual)
 {
     static bool stack_reported;
@@ -238,30 +275,53 @@ static bool fetch_balance_once(bool manual)
         ESP_LOGI(TAG, "网络任务栈水位线: %lu 字节剩余",
                  (unsigned long)uxTaskGetStackHighWaterMark(NULL));
     }
-    if (err != ESP_OK) {
-        s_ui.status = WHALE_ST_NETWORK_FAILED;
-        publish_ui();
-        if (manual) play_sound(WHALE_SND_ERROR);
-        return false;
-    }
-    if (result.http_status == 401 || result.http_status == 403) {
+    // 分级的关键顺序:**先看服务端给没给状态码**。
+    // whale_net_fetch_balance() 即使自己返回错误,也会把收到的 HTTP 状态码填进 result。
+    // 对方明明回话了(401/429/5xx)却因为流式响应中途断流导致 err != ESP_OK,若按
+    // "传输层失败"一律报"网络不可用",用户就会跑去重启路由器 —— 实际上本地网络好好的。
+    const int status = result.http_status;
+
+    if (status >= 400 && status < 500 && status != 429) {
+        // 请求侧 4xx:Key 写错(401/403)、参数不对(400)、账户没钱(402)。
+        // 这是永久性错误,重试多少次都一样,不参与"连续失败"计数,立刻明说。
+        ESP_LOGW(TAG, "余额接口拒绝请求: HTTP %d", status);
         s_ui.status = WHALE_ST_AUTH_FAILED;
         publish_ui();
         if (manual) play_sound(WHALE_SND_ERROR);
         return false;
     }
-    if (result.http_status != 200) {
-        s_ui.status = WHALE_ST_NETWORK_FAILED;
+    if (status == 429 || status >= 500) {
+        // 服务器侧:429 限流或 5xx。这一侧什么都改不了,别让用户去查路由器。
+        if (note_failure(WHALE_ST_SERVER_BUSY) && manual) play_sound(WHALE_SND_ERROR);
         publish_ui();
-        if (manual) play_sound(WHALE_SND_ERROR);
+        return false;
+    }
+
+    if (err != ESP_OK) {
+        // 走到这儿说明对方压根没给一个完整响应(DNS/TLS/连接失败、读超时)。
+        // 用 Wi-Fi 是否还在来区分"本地链路断了"和"对方不理我":
+        if (whale_net_state() != WHALE_NET_CONNECTED) {
+            if (note_failure(WHALE_ST_NET_UNREACHABLE) && manual) play_sound(WHALE_SND_ERROR);
+        } else {
+            // 链路是通的,只是这趟请求没成(多半是对方超时/断流)—— 不冤枉本地网络。
+            if (note_failure(WHALE_ST_API_TIMEOUT) && manual) play_sound(WHALE_SND_ERROR);
+        }
+        publish_ui();
+        return false;
+    }
+
+    if (status != 200) {
+        // 既不是成功也不是上面那几类(3xx 之类):拿不到余额正文,按"没同步上"处理。
+        if (note_failure(WHALE_ST_API_TIMEOUT) && manual) play_sound(WHALE_SND_ERROR);
+        publish_ui();
         return false;
     }
 
     whale_balance_t balance;
     if (!whale_balance_extract(body, &balance)) {
-        s_ui.status = WHALE_ST_NETWORK_FAILED;
+        // 拿到了响应但读不出余额:多半是返回体被截断或字段变了。
+        if (note_failure(WHALE_ST_DATA_ERROR) && manual) play_sound(WHALE_SND_ERROR);
         publish_ui();
-        if (manual) play_sound(WHALE_SND_ERROR);
         return false;
     }
 
@@ -278,6 +338,10 @@ static bool fetch_balance_once(bool manual)
     s_ui.today_used_cents = s_ledger.used_cents;
     s_ui.last_delta_cents = delta;
     s_ui.status = WHALE_ST_ONLINE;
+    // 这一轮通了:失败计数清零,并把眼下这个时刻记成"数据更新于"。
+    // publish_ui() 会不停刷新 s_ui.updated(那是当前时钟),所以这里必须先拷一份快照。
+    s_fail_streak = 0;
+    snprintf(s_ui.updated_ok, sizeof(s_ui.updated_ok), "%s", s_ui.updated);
 
     on_balance_event(event, delta);
     check_thresholds();
@@ -299,13 +363,13 @@ static void connect_and_refresh(void)
     publish_ui();
 
     if (whale_net_sta_connect(s_config.ssid, s_config.password) != ESP_OK) {
-        s_ui.status = WHALE_ST_NETWORK_FAILED;
+        note_failure(WHALE_ST_NET_UNREACHABLE);
         publish_ui();
         return;
     }
     if (!whale_net_wait_connected(CONNECT_TIMEOUT_MS)) {
         ESP_LOGW(TAG, "Wi-Fi 连接超时: %s", esp_err_to_name(whale_net_last_error()));
-        s_ui.status = WHALE_ST_NETWORK_FAILED;
+        note_failure(WHALE_ST_NET_UNREACHABLE);
         publish_ui();
         return;
     }
@@ -339,6 +403,9 @@ static void net_task(void *arg)
                 }
                 break;
             case CMD_CONFIG_SAVED:
+                // 走完一次表单多半换了 SSID / Key,旧的失败计数与"上次成功时刻"作废。
+                s_fail_streak = 0;
+                s_ui.updated_ok[0] = '\0';
                 whale_ui_provision_update(WHALE_PV_CONNECTING, NULL, NULL, NULL);
                 connect_and_refresh();
                 whale_ui_provision_update(whale_net_state() == WHALE_NET_CONNECTED
@@ -366,6 +433,9 @@ static void net_task(void *arg)
                 snprintf(s_ui.key_hint, sizeof(s_ui.key_hint), "none");
                 s_ui.has_balance = false;
                 s_ui.status = WHALE_ST_UNCONFIGURED;
+                // 凭据都没了,之前的失败计数和"上次成功时刻"也不再有意义。
+                s_fail_streak = 0;
+                s_ui.updated_ok[0] = '\0';
                 publish_ui();
                 break;
             default:
@@ -374,15 +444,25 @@ static void net_task(void *arg)
             s_busy = false;
         }
 
-        // 自动刷新:只在已连接且不在配网时跑,间隔由设置项决定。
-        if (!whale_prov_running() && whale_config_ready(&s_config) &&
-            whale_net_state() == WHALE_NET_CONNECTED) {
+        // 自动取数与失败重试:配网进行中一律不插手,把资源让给 SoftAP。
+        if (!whale_prov_running() && whale_config_ready(&s_config)) {
+            const bool connected = whale_net_state() == WHALE_NET_CONNECTED;
             const int64_t now = esp_timer_get_time();
-            const int64_t interval = (int64_t)s_config.refresh_sec * 1000 * 1000;
+            // 有失败悬着就按退避表走(失败越多等得越久);一路顺利才用设置里的刷新间隔。
+            const int64_t interval = (s_fail_streak > 0) ? backoff_us()
+                                                        : (int64_t)s_config.refresh_sec * 1000 * 1000;
             if (now - s_last_refresh_us >= interval) {
                 s_last_refresh_us = now;
                 s_busy = true;
-                fetch_balance_once(false);
+                if (!connected) {
+                    // Wi-Fi 掉线也必须肯自己重连。以前的写法要求"已连接才轮询",
+                    // 于是掉线之后没有任何一条路径能把它拉回来 —— 状态行会永远
+                    // 停在"网络不可用",直到用户按键或重启。
+                    ESP_LOGW(TAG, "Wi-Fi 已掉线,尝试重新连接");
+                    connect_and_refresh();
+                } else {
+                    fetch_balance_once(false);
+                }
                 s_busy = false;
             }
         }

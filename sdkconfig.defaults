@@ -19,9 +19,17 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # --- LVGL ---
 CONFIG_LV_COLOR_DEPTH_16=y
-# 20 ms display refresh period targets up to 50 FPS when rendering and SPI
-# transfer complete within the same budget.
-CONFIG_LV_DEF_REFR_PERIOD=20
+# 刷新周期:原来 20 ms(目标 50 FPS)是跑不满的 —— 240×320 RGB565 全屏 153,600 B,
+# 80 MHz SPI 光传数据就要 ~15 ms,再叠加软件渲染、每块缓冲的字节交换、单缓冲
+# 8 次 flush 的等待,单帧轻松超过 20 ms。结果是 LVGL 追不上自己设的节奏,
+# 帧间隔忽长忽短(重绘面积逐帧还在变),动画就"一顿一顿"。
+# 锁到 33 ms(30 FPS)给每帧留出余量:帧率数字变低,但帧间隔稳定,观感更顺。
+CONFIG_LV_DEF_REFR_PERIOD=33
+# 诊断用:屏幕右下角实时显示 FPS 与 CPU 占用(v18~v21 用来确认性能优化有没有真的提帧,
+# 实测已完成 —— 静态 ~30 fps、中间层是真凶)。现在关掉,正式固件不要留这个浮层。
+# 需要再诊断时把下面两行放开即可(LV_USE_PERF_MONITOR 依赖 LV_USE_SYSMON,必须成对开)。
+# CONFIG_LV_USE_SYSMON=y
+# CONFIG_LV_USE_PERF_MONITOR=y
 # 本应用不直接用 Montserrat(中文与数字都走自建子集),只保留 LVGL 默认的 14。
 CONFIG_LV_FONT_MONTSERRAT_14=y
 # LVGL 分配器:改用系统堆的 malloc/realloc/free,不再用 LVGL 自带的 TLSF 静态池。
