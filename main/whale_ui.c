@@ -838,6 +838,14 @@ bool whale_ui_init(void)
 {
     if (s_ready) return true;
 
+    // 建屏必须独占 LVGL:显示任务每 33ms 就遍历一次整棵对象树重算布局,
+    // 而对象上的 lv_obj_add_style 中途会重新分配该对象的 styles 数组。
+    // 两边放任并发,渲染任务就会读到「style_cnt 已递增、styles 指针还没填」
+    // 的中间态,在 get_prop_core 里解空指针 —— 表现就是开机瞬间
+    // Guru Meditation (Load access fault, MTVAL=0x4)。
+    // 端口锁可重入,下面 show_page / start_idle_boing 内部再锁一次无妨。
+    if (!bsp_lvgl_lock(1000)) return false;
+
     build_home();
     build_settings();
     build_provision();
@@ -845,12 +853,17 @@ bool whale_ui_init(void)
     s_ready = true;
     whale_ui_show_page(WHALE_PAGE_HOME);
     start_idle_boing();
+    bsp_lvgl_unlock();
     return true;
 }
 
 void whale_ui_show_page(whale_page_t page)
 {
     if (!s_ready) return;
+
+    // lv_screen_load 会让显示任务立刻按新屏整屏重绘,同样不能和渲染任务并跑。
+    // 锁不到就先不切(保持原页),总好过 s_page 改了、屏幕却没换。
+    if (!bsp_lvgl_lock(200)) return;
 
     s_page = page;
     switch (page) {
@@ -864,6 +877,7 @@ void whale_ui_show_page(whale_page_t page)
         lv_screen_load(s_prov.base.screen);
         break;
     }
+    bsp_lvgl_unlock();
 }
 
 whale_page_t whale_ui_current_page(void)
@@ -1029,17 +1043,33 @@ static void render_bubble_content(const whale_ui_state_t *state, int view)
         whale_money_format(state->today_used_cents, money, sizeof(money));
         snprintf(big, sizeof(big), "¥%s", money);
         lv_label_set_text(s_home.amount, big);
-        if (state->last_delta_cents < 0) {
+        // 补充行说清「最近这一笔变化」是什么。照 last_delta_cents 的正负分不开
+        // 赠金到账和充值 —— 两者都是正数,但一个该说「平台送的」,一个才是「我充的」。
+        if (state->last_event == WHALE_LEDGER_SPEND) {
             whale_money_format(-state->last_delta_cents, money, sizeof(money));
             snprintf(line, sizeof(line), "本次消费 ¥%s", money);
-        } else if (state->last_delta_cents > 0) {
+        } else if (state->last_event == WHALE_LEDGER_TOPUP) {
             whale_money_format(state->last_delta_cents, money, sizeof(money));
             snprintf(line, sizeof(line), "本次充值 ¥%s", money);
+        } else if (state->last_event == WHALE_LEDGER_GRANT) {
+            whale_money_format(state->last_delta_cents, money, sizeof(money));
+            snprintf(line, sizeof(line), "赠金到账 ¥%s", money);
         } else {
             snprintf(line, sizeof(line), "本次无变化");
         }
         lv_label_set_text(s_home.hint, line);
     } else if (view == 2) {
+        // 余额拆成两半讲:大字是平台送的赠金,补充行是自己充的钱。
+        // 客户报「余额怎么还越来越多了」就是因为之前看不到这一半 —— 赠金到账让
+        // 总余额上涨(甚至反过来把当日消费全抹平),界面上却给不出任何解释。
+        lv_label_set_text(s_home.label, "赠金余额");
+        whale_money_format(state->granted_cents, money, sizeof(money));
+        snprintf(big, sizeof(big), "¥%s", money);
+        lv_label_set_text(s_home.amount, big);
+        whale_money_format(state->topped_cents, money, sizeof(money));
+        snprintf(line, sizeof(line), "充值 ¥%s", money);
+        lv_label_set_text(s_home.hint, line);
+    } else if (view == 3) {
         // 峰谷视图照挂件的「显示样式」走:标签随样式变(倒计时样式另标),主数值是
         // 该样式的状态文字,补充行始终是倒计时。倒计时样式反过来 —— 主数值是倒计时。
         const bool peak = state->tariff == WHALE_TARIFF_PEAK;

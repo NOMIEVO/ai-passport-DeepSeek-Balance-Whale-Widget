@@ -69,7 +69,8 @@ typedef enum {
 } whale_setting_t;
 
 // 泡泡序列:挂件里「点按角色推进队列」,走到最后一项再按一次收起泡泡。
-#define WHALE_VIEW_COUNT 4     // 0 余额 / 1 今日已用 / 2 峰谷 / 3 连接
+// 0 余额 / 1 今日已用 / 2 赠金余额 / 3 峰谷 / 4 连接
+#define WHALE_VIEW_COUNT 5
 
 typedef struct {
     int battery;                 // -1 表示电量不可用
@@ -78,6 +79,12 @@ typedef struct {
     int64_t balance_cents;
     int64_t today_used_cents;
     int64_t last_delta_cents;
+    // 上次余额变化的种类(whale_ledger_event_t)。光看 last_delta_cents 的正负分不清
+    // 「平台送的赠金到账」和「自己充的钱到账」 —— 正负号一样,但该说的话完全不同。
+    whale_ledger_event_t last_event;
+    // 余额拆成两半:平台送的(赠金)和 自己充的。挂件页专门有一屏讲这件事。
+    int64_t granted_cents;       // 赠金余额
+    int64_t topped_cents;        // 充值余额
     bool tariff_known;
     whale_tariff_t tariff;
     int minutes_to_change;       // -1 = 当天不再切换

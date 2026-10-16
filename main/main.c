@@ -185,7 +185,13 @@ static void on_balance_event(whale_ledger_event_t event, int64_t delta_cents)
         ESP_LOGI(TAG, "检测到消费 %lld 分,今日累计 %lld 分",
                  (long long)-delta_cents, (long long)s_ledger.used_cents);
     } else if (event == WHALE_LEDGER_TOPUP) {
-        ESP_LOGI(TAG, "检测到充值 %lld 分(不冲抵消费)", (long long)delta_cents);
+        ESP_LOGI(TAG, "检测到充值 %lld 分(自己充的,不冲抵消费)", (long long)delta_cents);
+    } else if (event == WHALE_LEDGER_GRANT) {
+        // 赠金到账:平台的故障补偿 / 活动赠送。以前这条和充值共用同一个分支,
+        // 日志里一律写「检测到充值」 —— 用户没充过钱却在界面上看到充值记录,
+        // 根源就在这里。现在两者分开报,并把冲抵后的已用额一起打出来。
+        ESP_LOGI(TAG, "检测到赠金到账 %lld 分(平台赠送,已冲抵当日已用),今日已用 %lld 分",
+                 (long long)delta_cents, (long long)s_ledger.used_cents);
     }
     whale_store_save_ledger(&s_ledger);
 }
@@ -330,13 +336,16 @@ static bool fetch_balance_once(bool manual)
     whale_net_local_time(day, sizeof(day), NULL, NULL);
 
     int64_t delta = 0;
-    const whale_ledger_event_t event = whale_ledger_observe(&s_ledger, day, balance.total_cents,
-                                                            &delta);
+    const whale_ledger_event_t event = whale_ledger_observe(&s_ledger, day, &balance, &delta);
 
     s_ui.has_balance = true;
     s_ui.balance_cents = balance.total_cents;
     s_ui.today_used_cents = s_ledger.used_cents;
     s_ui.last_delta_cents = delta;
+    s_ui.last_event = event;
+    // 赠金/充值两个分项原样带上界面:挂件页有一屏专门讲「余额里哪部分是平台送的」。
+    s_ui.granted_cents = balance.granted_cents;
+    s_ui.topped_cents = balance.topped_cents;
     s_ui.status = WHALE_ST_ONLINE;
     // 这一轮通了:失败计数清零,并把眼下这个时刻记成"数据更新于"。
     // publish_ui() 会不停刷新 s_ui.updated(那是当前时钟),所以这里必须先拷一份快照。
@@ -556,7 +565,12 @@ static void settings_activate(void)
         // 只清当日累计,不动 Wi-Fi 与 API Key。
         s_ledger.used_cents = 0;
         s_ledger.topup_cents = 0;
+        s_ledger.granted_in_cents = 0;
         s_ledger.last_cents = s_ui.balance_cents;
+        // 分项基准也要跟着归位:不更新的话,下一次观测会把「清零前就已经存在的
+        // 赠金存量」当成刚到账的一笔,凭空冲抵掉刚清零的账。
+        s_ledger.last_granted_cents = s_ui.granted_cents;
+        s_ledger.last_topped_cents = s_ui.topped_cents;
         s_ui.today_used_cents = 0;
         s_budget_hit = false;
         whale_store_save_ledger(&s_ledger);

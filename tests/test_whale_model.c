@@ -122,44 +122,164 @@ static void test_tariff(void)
 
 // ---- 记账 ------------------------------------------------------------------
 
+// 造一份余额报文截面。真实报文满足 total = 赠金 + 充值,这里也照这个构;
+// 只有 test_ledger_mixed 的最后一例会故意破坏它,用来模拟报文自相矛盾。
+static whale_balance_t mk_balance(int64_t total, int64_t granted, int64_t topped)
+{
+    whale_balance_t b;
+    memset(&b, 0, sizeof(b));
+    b.total_cents = total;
+    b.granted_cents = granted;
+    b.topped_cents = topped;
+    b.available = true;
+    memcpy(b.currency, "CNY", 4);
+    return b;
+}
+
 static void test_ledger(void)
 {
     whale_ledger_t ledger;
+    whale_balance_t b;
     int64_t delta = 0;
 
     whale_ledger_reset(&ledger, "2026-10-10");
     assert(!ledger.has_observation);
 
-    // 当日首次观测只建基线,不算消费。
-    assert(whale_ledger_observe(&ledger, "2026-10-10", 1000, &delta) == WHALE_LEDGER_FIRST);
+    // 当日首次观测只建基线,不算消费;两个分项的基准也一并记下。
+    b = mk_balance(1000, 0, 1000);
+    assert(whale_ledger_observe(&ledger, "2026-10-10", &b, &delta) == WHALE_LEDGER_FIRST);
     assert(delta == 0);
     assert(ledger.opening_cents == 1000 && ledger.used_cents == 0);
+    assert(ledger.last_granted_cents == 0 && ledger.last_topped_cents == 1000);
 
     // 余额下降 → 记消费。
-    assert(whale_ledger_observe(&ledger, "2026-10-10", 965, &delta) == WHALE_LEDGER_SPEND);
+    b = mk_balance(965, 0, 965);
+    assert(whale_ledger_observe(&ledger, "2026-10-10", &b, &delta) == WHALE_LEDGER_SPEND);
     assert(delta == -35 && ledger.used_cents == 35);
 
     // 再降一次累计。
-    assert(whale_ledger_observe(&ledger, "2026-10-10", 900, &delta) == WHALE_LEDGER_SPEND);
+    b = mk_balance(900, 0, 900);
+    assert(whale_ledger_observe(&ledger, "2026-10-10", &b, &delta) == WHALE_LEDGER_SPEND);
     assert(delta == -65 && ledger.used_cents == 100);
 
-    // 余额上升 → 记充值,不冲抵已记录的消费。
-    assert(whale_ledger_observe(&ledger, "2026-10-10", 1100, &delta) == WHALE_LEDGER_TOPUP);
+    // 余额上升、涨的是充值余额 → 记充值,不冲抵已记录的消费。
+    b = mk_balance(1100, 0, 1100);
+    assert(whale_ledger_observe(&ledger, "2026-10-10", &b, &delta) == WHALE_LEDGER_TOPUP);
     assert(delta == 200 && ledger.topup_cents == 200 && ledger.used_cents == 100);
 
     // 没变化。
-    assert(whale_ledger_observe(&ledger, "2026-10-10", 1100, &delta) == WHALE_LEDGER_UNCHANGED);
+    assert(whale_ledger_observe(&ledger, "2026-10-10", &b, &delta) == WHALE_LEDGER_UNCHANGED);
     assert(ledger.used_cents == 100 && ledger.topup_cents == 200);
 
-    // 跨日:以新余额重建基线,消费清零。
-    assert(whale_ledger_observe(&ledger, "2026-10-11", 1080, &delta) == WHALE_LEDGER_FIRST);
-    assert(ledger.used_cents == 0 && ledger.topup_cents == 0);
+    // 跨日:以新余额重建基线,当日累计清零。
+    b = mk_balance(1080, 0, 1080);
+    assert(whale_ledger_observe(&ledger, "2026-10-11", &b, &delta) == WHALE_LEDGER_FIRST);
+    assert(ledger.used_cents == 0 && ledger.topup_cents == 0 && ledger.granted_in_cents == 0);
     assert(ledger.opening_cents == 1080);
     assert(strcmp(ledger.day, "2026-10-11") == 0);
 
     // day 为空串时不触发跨日(时间还没同步出来的降级路径)。
-    assert(whale_ledger_observe(&ledger, "", 1000, &delta) == WHALE_LEDGER_SPEND);
+    b = mk_balance(1000, 0, 1000);
+    assert(whale_ledger_observe(&ledger, "", &b, &delta) == WHALE_LEDGER_SPEND);
     assert(ledger.used_cents == 80);
+
+    // 扣的是赠金余额(不是充值余额)时,一样算消费。
+    whale_ledger_reset(&ledger, "2026-10-12");
+    b = mk_balance(500, 500, 0);
+    assert(whale_ledger_observe(&ledger, "2026-10-12", &b, &delta) == WHALE_LEDGER_FIRST);
+    b = mk_balance(470, 470, 0);
+    assert(whale_ledger_observe(&ledger, "2026-10-12", &b, &delta) == WHALE_LEDGER_SPEND);
+    assert(delta == -30 && ledger.used_cents == 30);
+}
+
+// 赠金到账:必须和"充值"分开认,还要把当日已用冲抵回来。
+// 客户报"余额怎么还越来越多了"就是这条规则缺失造成的 —— 平台把故障期的消费以赠金
+// 形式返还,总余额涨回去了,界面上却一律显示"本次充值",已用额一分不减,两个数字打架。
+static void test_ledger_grant(void)
+{
+    whale_ledger_t ledger;
+    whale_balance_t b;
+    int64_t delta = 0;
+
+    // 起点:充值余额 1000,当天先花掉 300。
+    whale_ledger_reset(&ledger, "2026-10-15");
+    b = mk_balance(1000, 0, 1000);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_FIRST);
+    b = mk_balance(700, 0, 700);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_SPEND);
+    assert(ledger.used_cents == 300 && ledger.topup_cents == 0);
+
+    // 平台把这 300 全额返成赠金:总余额回到 1000,涨的那 300 全落在赠金上。
+    b = mk_balance(1000, 300, 700);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_GRANT);
+    assert(delta == 300);
+    assert(ledger.granted_in_cents == 300);
+    assert(ledger.topup_cents == 0);   // 一分钱都不许记成充值
+    assert(ledger.used_cents == 0);    // 已用被冲抵干净
+
+    // 到账额超过当日已用时,已用归零,不记成负数。
+    b = mk_balance(1300, 600, 700);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_GRANT);
+    assert(ledger.granted_in_cents == 600);
+    assert(ledger.used_cents == 0);
+
+    // 对照:涨的是充值余额时只记充值,绝不碰当日已用。
+    whale_ledger_reset(&ledger, "2026-10-15");
+    b = mk_balance(1100, 0, 1100);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_FIRST);
+    b = mk_balance(1050, 0, 1050);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_SPEND);
+    assert(ledger.used_cents == 50);
+    b = mk_balance(1150, 0, 1150);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_TOPUP);
+    assert(ledger.topup_cents == 100 && ledger.used_cents == 50);
+}
+
+// 混合变化:两个分项朝相反方向走的时候,只看总额会得出错误结论。
+static void test_ledger_mixed(void)
+{
+    whale_ledger_t ledger;
+    whale_balance_t b;
+    int64_t delta = 0;
+
+    // 起点:赠金 200 + 充值 100 = 300。
+    whale_ledger_reset(&ledger, "2026-10-15");
+    b = mk_balance(300, 200, 100);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_FIRST);
+
+    // 赠金 200 花光,同时自己充进来 400 → 总余额 500,净涨 200。
+    // 只看总额会得出"充了 200"的错觉,实际上是花了 200 又充了 400。
+    b = mk_balance(500, 0, 500);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_TOPUP);
+    assert(delta == 200);
+    assert(ledger.used_cents == 200);
+    assert(ledger.topup_cents == 400);
+
+    // "充 100 送 20":赠金是随充值附赠的,本质上是买来的,不能拿来冲抵当日已用。
+    whale_ledger_reset(&ledger, "2026-10-15");
+    b = mk_balance(1000, 0, 1000);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_FIRST);
+    b = mk_balance(800, 0, 800);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_SPEND);
+    assert(ledger.used_cents == 200);
+    b = mk_balance(920, 20, 900);   // 充值 +100、赠金 +20,发生在同一轮
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_TOPUP);
+    assert(delta == 120);
+    assert(ledger.topup_cents == 100);
+    assert(ledger.granted_in_cents == 20);
+    assert(ledger.used_cents == 200);   // 已用不受影响
+
+    // 分项之和与总额对不上(报文被截断 / 换了币种):退回只看总额的老口径 ——
+    // 宁可粗一点,也不能拿一份错的拆分去记错账。
+    whale_ledger_reset(&ledger, "2026-10-15");
+    b = mk_balance(1000, 0, 1000);
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_FIRST);
+    b = mk_balance(1200, 999, 500);   // 总额涨 200,两个分项加起来却差了 499
+    assert(whale_ledger_observe(&ledger, "2026-10-15", &b, &delta) == WHALE_LEDGER_TOPUP);
+    assert(delta == 200);
+    assert(ledger.topup_cents == 200);      // 按总额记
+    assert(ledger.granted_in_cents == 0);   // 分项整份丢弃
+    assert(ledger.used_cents == 0);         // 没有被误冲抵
 }
 
 // ---- 配置 ------------------------------------------------------------------
@@ -288,6 +408,8 @@ int main(void)
     test_balance_extract();
     test_tariff();
     test_ledger();
+    test_ledger_grant();
+    test_ledger_mixed();
     test_config();
     test_thresholds();
     test_peak_style();

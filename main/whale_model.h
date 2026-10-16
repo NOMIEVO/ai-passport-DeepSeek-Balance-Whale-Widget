@@ -96,29 +96,39 @@ whale_peak_style_t whale_peak_style_next(whale_peak_style_t style);
 whale_peak_style_t whale_peak_style_clamp(int value);
 
 // ---- 今日已用记账 ----------------------------------------------------------
-
+//
+// 余额报文同时给了「赠金」和「充值」两个分项,而且 total = 赠金 + 充值 是接口自带的
+// 恒等式。所以记账不能只看总额涨跌 —— 那样平台补偿到账的赠金会被当成用户自己充值,
+// 而用户明明没掏钱。这里每次观测都留一份分项快照,用两个分项各自的增减判断发生了什么:
+//   分项下降 → 花掉的钱   充值分项上升 → 自己充的钱   赠金分项上升 → 平台送的钱
 typedef struct {
     char day[WHALE_DAY_LEN];   // 记账日(北京时间)
     int64_t opening_cents;     // 当日首次观测到的余额
-    int64_t last_cents;        // 最近一次观测到的余额
-    int64_t used_cents;        // 当日累计消费(余额下降额之和)
-    int64_t topup_cents;       // 当日累计充值/赠金(余额上升额之和)
+    int64_t last_cents;        // 最近一次观测到的总余额
+    int64_t last_granted_cents;// 最近一次观测到的赠金余额(下次判定消费/到账的基准)
+    int64_t last_topped_cents; // 最近一次观测到的充值余额
+    int64_t used_cents;        // 当日净消费(已扣掉平台返还的赠金,不会为负)
+    int64_t topup_cents;       // 当日累计充值(只算自己掏的钱)
+    int64_t granted_in_cents;  // 当日累计到账的赠金(平台返还 / 活动赠送)
     bool has_observation;      // 当日是否已有观测
 } whale_ledger_t;
 
 typedef enum {
     WHALE_LEDGER_FIRST = 0,    // 当日(或首次)建立基线,不计消费
     WHALE_LEDGER_UNCHANGED,    // 余额没变
-    WHALE_LEDGER_SPEND,        // 余额下降 → 记消费
-    WHALE_LEDGER_TOPUP,        // 余额上升 → 记充值,不冲抵消费
+    WHALE_LEDGER_SPEND,        // 余额净下降 → 记消费
+    WHALE_LEDGER_TOPUP,        // 余额净上升,涨的是充值余额 → 自己充的钱
+    WHALE_LEDGER_GRANT,        // 余额净上升,涨的是赠金 → 平台送的钱,冲抵当日已用
 } whale_ledger_event_t;
 
 void whale_ledger_reset(whale_ledger_t *ledger, const char *day);
 
 // 观测一次余额。跨日(day 与账本里记录的不同)时自动以新余额重建基线。
-// delta_cents 可为 NULL;它返回本次余额变化量(负=消费,正=充值)。
+// balance 必须带 granted/topped 分项 —— 少了它们就只能退回「只看总额」的粗口径。
+// delta_cents 可为 NULL;它返回本次总余额变化量(负=花掉,正=多出来)。
 whale_ledger_event_t whale_ledger_observe(whale_ledger_t *ledger, const char *day,
-                                          int64_t balance_cents, int64_t *delta_cents);
+                                          const whale_balance_t *balance,
+                                          int64_t *delta_cents);
 
 // ---- 配置 ------------------------------------------------------------------
 

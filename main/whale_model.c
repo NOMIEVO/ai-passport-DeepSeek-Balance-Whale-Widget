@@ -266,34 +266,84 @@ void whale_ledger_reset(whale_ledger_t *ledger, const char *day)
 }
 
 whale_ledger_event_t whale_ledger_observe(whale_ledger_t *ledger, const char *day,
-                                          int64_t balance_cents, int64_t *delta_cents)
+                                          const whale_balance_t *balance,
+                                          int64_t *delta_cents)
 {
-    if (ledger == NULL) return WHALE_LEDGER_UNCHANGED;
+    if (ledger == NULL || balance == NULL) return WHALE_LEDGER_UNCHANGED;
 
+    const int64_t total = balance->total_cents;
     const bool new_day = day != NULL && day[0] != '\0' &&
                          strncmp(day, ledger->day, WHALE_DAY_LEN - 1) != 0;
 
     if (!ledger->has_observation || new_day) {
         whale_ledger_reset(ledger, day);
-        ledger->opening_cents = balance_cents;
-        ledger->last_cents = balance_cents;
+        ledger->opening_cents = total;
+        ledger->last_cents = total;
+        ledger->last_granted_cents = balance->granted_cents;
+        ledger->last_topped_cents = balance->topped_cents;
         ledger->has_observation = true;
         if (delta_cents != NULL) *delta_cents = 0;
         return WHALE_LEDGER_FIRST;
     }
 
-    const int64_t delta = balance_cents - ledger->last_cents;
-    ledger->last_cents = balance_cents;
+    const int64_t delta = total - ledger->last_cents;
+    ledger->last_cents = total;
     if (delta_cents != NULL) *delta_cents = delta;
 
-    if (delta < 0) {
-        ledger->used_cents += -delta;
-        return WHALE_LEDGER_SPEND;
+    int64_t granted_delta = balance->granted_cents - ledger->last_granted_cents;
+    int64_t topped_delta = balance->topped_cents - ledger->last_topped_cents;
+    ledger->last_granted_cents = balance->granted_cents;
+    ledger->last_topped_cents = balance->topped_cents;
+
+    // 两个分项之和必须等于总额的变化(total = 赠金 + 充值 是报文自带的恒等式)。
+    // 对不上说明这次响应的分项不可信(换了币种、字段缺失、报文被截断)—— 丢掉分项,
+    // 退回「只看总额」的老口径:宁可粗一点,也不要拿一份错的拆分去记错账。
+    const bool split_ok = (granted_delta + topped_delta == delta);
+    if (!split_ok) {
+        granted_delta = 0;
+        topped_delta = 0;
     }
-    if (delta > 0) {
-        ledger->topup_cents += delta;
-        return WHALE_LEDGER_TOPUP;
+
+    // 这一轮涨上来的到底是不是平台送的钱?必须「分项可信 + 赠金涨了 + 充值没涨」
+    // 三条同时成立。有充值的那一轮不算 —— 那多半是「充 100 送 20」,赠金是随充值
+    // 附赠的,本质上是用户自己买来的,拿来冲抵消费会少算支出。
+    const bool by_grant = split_ok && granted_delta > 0 && topped_delta <= 0;
+
+    // 花掉的钱 = 两个分项各自的下降额之和。它的价值在两个分项朝相反方向走的时候:
+    // 赠金花掉 200 的同时充值进来 400,总额看着只是"涨了 200",实际上花掉的 200
+    // 和充进来的 400 是两码事 —— 只看总额会把前者整个漏掉。
+    int64_t spent = 0;
+    if (granted_delta < 0) spent += -granted_delta;
+    if (topped_delta < 0) spent += -topped_delta;
+    if (spent == 0 && delta < 0) spent = -delta;   // 分项不可用时的兜底
+    ledger->used_cents += spent;
+
+    // 自己充的钱:充值分项的上升额。
+    if (topped_delta > 0) {
+        ledger->topup_cents += topped_delta;
+    } else if (granted_delta == 0 && delta > 0) {
+        ledger->topup_cents += delta;              // 分项不可用时的兜底
     }
+
+    // 平台送的钱:赠金分项的上升额。故障期消费被全额返还成赠金、活动发放赠金,
+    // 都走这一条。
+    if (granted_delta > 0) {
+        ledger->granted_in_cents += granted_delta;
+        if (by_grant) {
+            // 从「今日已用」里扣回来 —— 否则余额涨了、已用却不动,两个数字互相打架
+            // (客户就是这么发现「余额越来越多」的)。下限钳在 0:到账超过当日已用时
+            // 已用归零,多出来的是白赚的,不该记成负数。
+            //
+            // 冲抵必须排在消费入账**之后**:同一次刷新里既消费又到账赠金时,
+            // 先冲抵会把钳位下限提前用掉,净支出就少算了。
+            ledger->used_cents -= granted_delta;
+            if (ledger->used_cents < 0) ledger->used_cents = 0;
+        }
+    }
+
+    // 事件按余额的净变化方向报 —— 用户看的是余额涨了还是跌了。
+    if (delta > 0) return by_grant ? WHALE_LEDGER_GRANT : WHALE_LEDGER_TOPUP;
+    if (delta < 0) return WHALE_LEDGER_SPEND;
     return WHALE_LEDGER_UNCHANGED;
 }
 

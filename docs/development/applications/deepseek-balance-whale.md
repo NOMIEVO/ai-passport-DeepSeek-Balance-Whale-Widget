@@ -35,11 +35,11 @@ two shrinking small ellipse bubbles below it; the text is **three centred rows**
 | Whale | The widget's original `DSniang1.png` (139 x 139, RGB565A8), rows 123..262, pinned right (columns 95..234, 6 px from the right edge); idle squash breathing |
 | Balance animation | The main value **rolls** to the new balance on change (600 ms tween); see below |
 | Status line | Peak/valley badge, then unconfigured / connecting / online / refreshing / invalid key / network down / over budget / balance low |
-| Hint line | `Long press menu · up refresh · down preview` |
+| Hint line | `Long-press menu · up refresh · down head-pat` (no spaces around `·` — see the 25th build) |
 
 Bubble sequence (the widget advances its queue on tap and closes after the last item):
-**balance → today's spend → tariff → connection → closed** (closed leaves only the whale;
-the next press restarts from balance).
+**balance → today's spend → granted credit → tariff → connection → closed** (closed leaves
+only the whale; the next press restarts from balance).
 
 | Input | Action |
 | --- | --- |
@@ -263,9 +263,13 @@ window. This is best effort only; nothing is hijacked.
   (`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`).
 - Refresh interval: 30 / 60 / 120 / 300 s, default 60 s. Automatic while online,
   manual on OK short press.
-- Accounting follows the open-source widget: a **drop** in balance accumulates as
-  today's spend, a **rise** is recorded as a top-up and never cancels recorded
-  spend; a new Beijing-time day rebuilds the baseline. The ledger lives in NVS.
+- Accounting reads **both** sub-fields of the balance report: `granted_balance` (credit
+  from DeepSeek) and `topped_up_balance` (money you paid in). A drop in either accumulates
+  as today's spend; a rise in the topped-up part is a top-up; a rise in the granted part is
+  **granted credit arriving**, which is deducted from today's spend — money the platform
+  hands back is not money the user spent. If the two sub-fields do not add up to the change
+  in the total (currency switch, truncated reply), it falls back to the total-only rule.
+  A new Beijing-time day rebuilds the baseline. The ledger lives in NVS.
 - Tariff: weekdays 09:00–12:00 and 14:00–18:00 are peak, everything else is
   off-peak; weekends are off-peak all day.
 - Time comes from SNTP after connecting (`CST-8`). If sync fails, the tariff row
@@ -751,6 +755,80 @@ were all clean. It should be unrelated to this change — with no credentials st
 and the balance fetch later returned 200. Suspected fallout of NVS sitting all-0xFF
 right after a full-chip erase. **If it recurs, capture that serial output** (the panic
 PC/EXCVADDR is what `Addr2Line` needs to point at a source line).
+
+> **Resolved in the 28th build.** It did recur — on the first boot after flashing that
+> version — and the captured serial output named the real culprit: **`whale_ui_init()`
+> was the only LVGL entry point left without the port lock.** Not an NVS artifact.
+
+## 27th firmware (granted vs. topped-up credit, sha256 `54286d6f…4aa2`)
+
+Customer: *"that's not right, the balance keeps going UP."* Not a bug in the
+arithmetic — DeepSeek's outage compensation had landed as **granted credit**, which
+`total_balance` correctly counts. Three real defects were hiding behind it:
+
+| # | Defect | Fix |
+| --- | --- | --- |
+| A | Granted credit was invisible; a rising balance had no explanation | New 3rd bubble view "Granted credit" (bubble sequence 4 → 5) |
+| B | A grant arriving was labelled "Topped up" | New `WHALE_LEDGER_GRANT` event → "Granted credit ¥x.xx", logged separately |
+| C | Today's spend only ever grew, double-counting money a grant gave back | A grant **offsets** today's spend (floor 0) |
+
+The key insight is the identity already present in the payload:
+`total_balance = granted_balance + topped_up_balance`. The two sub-amounts were being
+parsed all along but were never copied into the UI state — that is the whole of A, and
+the shared cure for B and C. `whale_ledger_observe()` now takes
+`const whale_balance_t *` and judges by sub-amount: a drop is spend, a rise in the
+top-up leg is a top-up, a rise in the grant leg is a grant. Three edges are tested:
+a round that also has a top-up never offsets; the offset runs *after* spend is booked;
+and when the sub-amounts do not add up to the total change the split is discarded and
+the coarse total-only rule is used.
+
+**Not flashed at the time** — COM4 vanished from the USB bus mid-flash
+(`Present: False` on all three `VID_303A&PID_1001` interfaces). Flashed later, and
+that first boot is what exposed the 28th build's crash.
+
+## 28th firmware (LVGL init race fixed, sha256 `75a88a17…62ad`)
+
+The first boot after flashing the 27th build crashed ~0.5 s in:
+
+```
+I (531) whale: no ledger, accounting starts at this observation   <- main.c:852
+Guru Meditation Error: Core  0 panic'ed (Load access fault). Exception was unhandled.
+MEPC : 0x4201d1c0   RA : 0x4201d256   MCAUSE : 0x00000005   MTVAL : 0x00000004
+```
+
+`addr2line` put the whole chain inside LVGL:
+
+```
+lvgl_port_task → lv_timer_handler → lv_display_refr_timer
+  → lv_obj_update_layout → lv_obj_get_content_coords
+    → lv_obj_get_style_pad_left → get_prop_core   💥
+```
+
+`MTVAL = 0x4` is the tell: `has_group` sits at offset 4 in `lv_style_t`, so
+`obj->styles[i].style == NULL` — the render task walked a tree whose style array was
+**half-updated**.
+
+**Root cause.** `whale_ui_init()` (builds all three screens) and
+`whale_ui_show_page()` (`lv_screen_load`) were the only two of the ten public
+`whale_ui_*` entry points that did **not** take `bsp_lvgl_lock()` — the other eight
+all do. `lv_obj_add_style` reallocs the object's `styles` array part-way through, while
+`lvgl_port_task` walks the whole tree every 33 ms to recompute layout. Run both and the
+reader can observe `style_cnt` already bumped with the `styles` pointer not yet stored.
+
+The log position pins it down: the last line before the panic is at `main.c:852`, and
+`main.c:866` — right after it — is the call to `whale_ui_init()`.
+
+**Fix.** Take the port lock in both functions. The port mutex is a
+`xSemaphoreCreateRecursiveMutex()`, so the nested lock inside `whale_ui_init()`'s call
+to `whale_ui_show_page()` is safe. A failed lock in `whale_ui_show_page()` now leaves
+the page alone rather than updating `s_page` without swapping the screen.
+
+**Verified on device: 23 consecutive reset-boots, 0 crashes** (the fault reproduced
+1 in 11 boots before). In the post-fix boot log the line after that ledger entry is now
+`button: IoT Button Version: 4.2.0` — precisely where it used to die.
+
+App 1,783,488 B (79% free), merged image 1,849,024 B. `verify_firmware` /
+`archive_firmware` / font coverage all PASS.
 
 ## Not verified on hardware
 
